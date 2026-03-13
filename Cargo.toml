@@ -1,0 +1,62 @@
+[package]
+name = "cfmpeg"
+version = "0.1.0"
+edition = "2021"
+description = "Cloud ffmpeg — run ffmpeg commands on powerful remote containers"
+license = "MIT"
+repository = "https://github.com/aaronfrancis/cfmpeg"
+homepage = "https://cfmpeg.dev"
+keywords = ["ffmpeg", "video", "encoding", "cloud"]
+categories = ["command-line-utilities", "multimedia::video"]
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Progress display
+indicatif = "0.17"
+console = "0.15"
+
+# File hashing
+sha2 = "0.10"
+
+# Config/paths
+dirs = "5"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async streaming
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+futures = "0.3"
+
+# URL parsing
+url = "2"
+
+# Eventsource / SSE
+eventsource-stream = "0.2"
+reqwest-eventsource = "0.6"
+
+# Open browser for auth
+open = "5"
+
+# UUID for job correlation
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
