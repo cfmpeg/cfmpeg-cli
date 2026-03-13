@@ -37,6 +37,8 @@ cfmpeg auth login
 cfmpeg -i input.mov -c:v libx265 -crf 28 output.mp4
 ```
 
+`cfmpeg auth login` opens the API key page and then prompts you to paste the key back into the CLI for local storage.
+
 ## How It Works
 
 1. You run `cfmpeg` with standard ffmpeg arguments
@@ -86,7 +88,7 @@ local_fallback = true
 
 ```bash
 cfmpeg config path    # Print config path
-cfmpeg config show    # Print current config
+cfmpeg config show    # Print current config with the API key masked
 cfmpeg config edit    # Open in $EDITOR
 ```
 
@@ -116,11 +118,13 @@ If the API is unreachable and `local_fallback = true` (default), cfmpeg automati
 ## Development
 
 ```bash
-git clone https://github.com/aaronfrancis/cfmpeg.git
-cd cfmpeg
-cargo build
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
+cargo build --locked
 ```
+
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs the same checks on pushes and pull requests to `main`.
 
 ## License
 
