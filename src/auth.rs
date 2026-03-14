@@ -2,14 +2,14 @@ use crate::config::Config;
 use crate::error::{CfmpegError, Result};
 use std::io::{self, Write};
 
-const API_KEY_URL: &str = "https://cfmpeg.dev/dashboard/api-keys";
-
 pub async fn login(config: &mut Config) -> Result<()> {
+    let api_key_url = config.dashboard_api_keys_url();
+
     println!("Open this page to create an API key:");
-    println!("  {API_KEY_URL}");
+    println!("  {api_key_url}");
     println!();
 
-    if let Err(error) = open::that(API_KEY_URL) {
+    if let Err(error) = open::that(&api_key_url) {
         eprintln!("warning: failed to open browser automatically: {error}");
     }
 

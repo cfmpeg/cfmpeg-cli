@@ -7,6 +7,7 @@ mod error;
 mod fallback;
 mod job;
 mod parser;
+mod remote;
 mod upload;
 
 use crate::api::{ApiClient, CreateJobRequest, JobInput};
@@ -48,7 +49,8 @@ async fn run() -> Result<()> {
         Command::Encode {
             ffmpeg_args,
             force_local,
-        } => run_encode(&ffmpeg_args, force_local).await,
+            remote,
+        } => run_encode(&ffmpeg_args, force_local, remote).await,
         Command::Help => {
             cli::print_help();
             Ok(())
@@ -90,6 +92,11 @@ fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
                 api_key: config.api_key().map(|value| mask_secret(&value)),
                 api_base: config.api_base(),
                 local_fallback: config.local_fallback,
+                remote_profile: config.remote_profile.clone(),
+                remote_cpu: config.remote_cpu,
+                remote_memory_mb: config.remote_memory_mb,
+                remote_gpu: config.remote_gpu.clone(),
+                remote_timeout_seconds: config.remote_timeout_seconds,
             };
 
             let contents = toml::to_string_pretty(&display_config).map_err(|error| {
@@ -101,8 +108,13 @@ fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
     }
 }
 
-async fn run_encode(ffmpeg_args: &[String], force_local: bool) -> Result<()> {
+async fn run_encode(
+    ffmpeg_args: &[String],
+    force_local: bool,
+    remote: remote::RemoteExecutionOptions,
+) -> Result<()> {
     let config = Config::load()?;
+    let effective_remote = remote.merge_defaults(&config.remote_execution_defaults()?);
 
     if force_local {
         eprintln!("  warning: running locally because --local was provided.");
@@ -122,13 +134,26 @@ async fn run_encode(ffmpeg_args: &[String], force_local: bool) -> Result<()> {
     };
 
     if !api.health_check().await {
-        if config.local_fallback {
+        if config.local_fallback && !effective_remote.requires_strict_remote() {
             eprintln!("  warning: api unreachable; falling back to local ffmpeg.");
+            if !effective_remote.is_empty() {
+                eprintln!(
+                    "  note: ignoring requested remote execution settings during local fallback."
+                );
+            }
             eprintln!();
             return fallback::run_local(ffmpeg_args).await;
         }
 
         return Err(CfmpegError::ApiUnreachable(config.api_base()));
+    }
+
+    if effective_remote.requests_gpu_execution() {
+        if let Some(detail) = parser::describe_gpu_compatibility_warning(ffmpeg_args) {
+            eprintln!(
+                "  warning: GPU remote execution was requested, but {detail}. Use `h264_nvenc`, `hevc_nvenc`, or `av1_nvenc`, or remove the GPU setting."
+            );
+        }
     }
 
     let http_client = Client::builder()
@@ -167,23 +192,28 @@ async fn run_encode(ffmpeg_args: &[String], force_local: bool) -> Result<()> {
     let outputs: Vec<String> = parsed
         .outputs
         .iter()
-        .map(|output| {
-            output
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("output")
-                .to_string()
-        })
+        .map(|output| output.remote_name.clone())
         .collect();
 
-    let job = api
-        .create_job(&CreateJobRequest {
-            ffmpeg_args: parsed.sandbox_args.clone(),
-            inputs: job_inputs,
-            outputs,
-        })
-        .await?;
+    let create_job_request = CreateJobRequest {
+        ffmpeg_args: parsed.sandbox_args.clone(),
+        inputs: job_inputs,
+        outputs,
+        execution: effective_remote.clone(),
+    };
+
+    let job = match api.create_job(&create_job_request).await {
+        Ok(job) => job,
+        Err(error) => {
+            if let Some(result) =
+                maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
+            {
+                return result;
+            }
+
+            return Err(error);
+        }
+    };
 
     eprintln!("  {} job {}", style("->").cyan(), style(&job.job_id).dim());
 
@@ -210,7 +240,16 @@ async fn run_encode(ffmpeg_args: &[String], force_local: bool) -> Result<()> {
         eprintln!();
     }
 
-    api.start_job(&job.job_id).await?;
+    if let Err(error) = api.start_job(&job.job_id).await {
+        if let Some(result) =
+            maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
+        {
+            return result;
+        }
+
+        return Err(error);
+    }
+
     job::wait_for_completion(&api, &http_client, &job.job_id).await?;
 
     let outputs = api.get_outputs(&job.job_id).await?;
@@ -246,6 +285,10 @@ async fn show_usage() -> Result<()> {
     println!("  GPU encoding: {:.1} minutes", usage.gpu_minutes);
     println!("  Total jobs:   {}", usage.jobs_count);
     println!(
+        "  Balance:      {}",
+        format_money_from_millicents(usage.balance_millicents, &usage.currency)
+    );
+    println!(
         "  Total cost:   ${:.2}",
         usage.total_cost_cents as f64 / 100.0
     );
@@ -263,6 +306,77 @@ async fn show_version() -> Result<()> {
     Ok(())
 }
 
+async fn maybe_fallback_to_local(
+    ffmpeg_args: &[String],
+    config: &Config,
+    effective_remote: &remote::RemoteExecutionOptions,
+    error: &CfmpegError,
+) -> Option<Result<()>> {
+    if !config.local_fallback
+        || effective_remote.requires_strict_remote()
+        || !should_fallback_to_local(error)
+    {
+        return None;
+    }
+
+    match api_error_code(error) {
+        Some("insufficient_funds") => {
+            eprintln!("  warning: remote balance is too low; falling back to local ffmpeg.");
+            eprintln!("  top up at {}", config.dashboard_billing_url());
+        }
+        _ => {
+            eprintln!(
+                "  warning: remote job execution is not enabled yet; falling back to local ffmpeg."
+            );
+        }
+    }
+
+    if !effective_remote.is_empty() {
+        eprintln!("  note: ignoring requested remote execution settings during local fallback.");
+    }
+
+    eprintln!();
+
+    Some(fallback::run_local(ffmpeg_args).await)
+}
+
+fn should_fallback_to_local(error: &CfmpegError) -> bool {
+    matches!(
+        error,
+        CfmpegError::Api { status, code, .. }
+            if matches!(status, 402 | 404 | 405 | 501 | 503)
+                || code.as_deref() == Some("insufficient_funds")
+    )
+}
+
+fn api_error_code(error: &CfmpegError) -> Option<&str> {
+    match error {
+        CfmpegError::Api { code, .. } => code.as_deref(),
+        _ => None,
+    }
+}
+
+fn format_money_from_millicents(value: i64, currency: &str) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    let absolute = value.abs();
+    let dollars = absolute / 100_000;
+    let fractional = absolute % 100_000;
+
+    format!(
+        "{sign}{}{:01}.{:05}",
+        currency_symbol(currency),
+        dollars,
+        fractional
+    )
+}
+
+fn currency_symbol(currency: &str) -> &str {
+    match currency.to_ascii_lowercase().as_str() {
+        "usd" => "$",
+        _ => "",
+    }
+}
+
 fn mask_secret(secret: &str) -> String {
     if secret.len() <= 8 {
         return "*".repeat(secret.len());
@@ -276,4 +390,30 @@ struct DisplayConfig {
     api_key: Option<String>,
     api_base: String,
     local_fallback: bool,
+    remote_profile: Option<String>,
+    remote_cpu: Option<u16>,
+    remote_memory_mb: Option<u32>,
+    remote_gpu: Option<String>,
+    remote_timeout_seconds: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_money_from_millicents, should_fallback_to_local};
+    use crate::error::CfmpegError;
+
+    #[test]
+    fn falls_back_for_insufficient_funds_errors() {
+        assert!(should_fallback_to_local(&CfmpegError::Api {
+            status: 402,
+            code: Some("insufficient_funds".to_string()),
+            message: "Insufficient prepaid balance.".to_string(),
+        }));
+    }
+
+    #[test]
+    fn formats_millicent_balances() {
+        assert_eq!(format_money_from_millicents(9_833, "usd"), "$0.09833");
+        assert_eq!(format_money_from_millicents(-167, "usd"), "-$0.00167");
+    }
 }

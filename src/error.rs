@@ -7,7 +7,11 @@ pub enum CfmpegError {
     #[error("api unreachable: {0}")]
     ApiUnreachable(String),
     #[error("api error ({status}): {message}")]
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
     #[error("configuration error: {0}")]
     Config(String),
     #[error("download failed for {filename}: {reason}")]

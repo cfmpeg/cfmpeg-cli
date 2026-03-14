@@ -1,0 +1,75 @@
+name: Release Binaries
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag to build binaries for (e.g., v1.2.3)'
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build binaries for (e.g., v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset_name: cfmpeg-darwin-arm64
+          - os: macos-13
+            asset_name: cfmpeg-darwin-x64
+          - os: ubuntu-24.04-arm
+            asset_name: cfmpeg-linux-arm64
+          - os: ubuntu-latest
+            asset_name: cfmpeg-linux-x64
+
+    steps:
+      - name: Normalize and validate tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          TAG="${TAG#refs/tags/}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid tag format '$TAG'. Expected vX.Y.Z"
+            exit 1
+          fi
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.value }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          cp target/release/cfmpeg "release/${{ matrix.asset_name }}"
+          chmod +x "release/${{ matrix.asset_name }}"
+          shasum -a 256 "release/${{ matrix.asset_name }}" > "release/${{ matrix.asset_name }}.sha256"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          files: |
+            release/${{ matrix.asset_name }}
+            release/${{ matrix.asset_name }}.sha256

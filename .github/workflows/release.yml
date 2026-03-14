@@ -1,0 +1,255 @@
+name: Release
+run-name: "Release ${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.2.0 or v1.2.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    if: github.actor == 'aarondfrancis'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Verify build
+        run: cargo build --locked
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.actor == 'aarondfrancis'
+    outputs:
+      version: ${{ steps.version.outputs.number }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Normalize and validate version
+        id: version
+        run: |
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid version format '$VERSION'. Expected X.Y.Z or vX.Y.Z"
+            exit 1
+          fi
+          echo "number=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        run: python3 scripts/set-version.py "${{ steps.version.outputs.number }}"
+
+      - name: Verify manifest after bump
+        run: cargo build --locked
+
+      - name: Commit version bump
+        run: |
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release v${{ steps.version.outputs.number }}"
+
+      - name: Create and push tag
+        run: |
+          git tag "v${{ steps.version.outputs.number }}"
+          git push origin "v${{ steps.version.outputs.number }}"
+
+      - name: Push to main
+        run: git push
+
+  release-binaries:
+    needs: release
+    if: github.actor == 'aarondfrancis'
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      tag: v${{ needs.release.outputs.version }}
+
+  update-homebrew:
+    needs:
+      - release
+      - release-binaries
+    runs-on: ubuntu-latest
+    if: github.actor == 'aarondfrancis'
+
+    steps:
+      - name: Update Homebrew formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${COMMITTER_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not configured."
+            exit 1
+          fi
+
+          TAP_DIR="$(mktemp -d)"
+          FORMULA_PATH="Formula/cfmpeg.rb"
+          RELEASE_BASE_URL="https://github.com/${REPOSITORY}/releases/download/v${VERSION}"
+
+          read_sha() {
+            local name="$1"
+            local hash=""
+            for attempt in {1..8}; do
+              hash="$(curl -fsSL "${RELEASE_BASE_URL}/${name}.sha256" | awk '{print $1}' | tr -d '\r\n' || true)"
+              if [[ "$hash" =~ ^[a-f0-9]{64}$ ]]; then
+                echo "$hash"
+                return 0
+              fi
+
+              if [ "$attempt" -eq 8 ]; then
+                echo "Failed to fetch valid checksum for ${name} after retries."
+                exit 1
+              fi
+
+              sleep 10
+            done
+          }
+
+          DARWIN_ARM64_SHA="$(read_sha cfmpeg-darwin-arm64)"
+          DARWIN_X64_SHA="$(read_sha cfmpeg-darwin-x64)"
+          LINUX_ARM64_SHA="$(read_sha cfmpeg-linux-arm64)"
+          LINUX_X64_SHA="$(read_sha cfmpeg-linux-x64)"
+
+          for hash in "$DARWIN_ARM64_SHA" "$DARWIN_X64_SHA" "$LINUX_ARM64_SHA" "$LINUX_X64_SHA"; do
+            if ! [[ "$hash" =~ ^[a-f0-9]{64}$ ]]; then
+              echo "Invalid checksum fetched from release assets: $hash"
+              exit 1
+            fi
+          done
+
+          git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/${REPOSITORY_OWNER}/homebrew-tap.git" "$TAP_DIR"
+          cd "$TAP_DIR"
+
+          cat > "$FORMULA_PATH" <<EOF
+          class Cfmpeg < Formula
+            desc "Cloud ffmpeg CLI that runs ffmpeg jobs on remote containers"
+            homepage "https://github.com/${REPOSITORY}"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${RELEASE_BASE_URL}/cfmpeg-darwin-arm64"
+                sha256 "${DARWIN_ARM64_SHA}"
+              else
+                url "${RELEASE_BASE_URL}/cfmpeg-darwin-x64"
+                sha256 "${DARWIN_X64_SHA}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${RELEASE_BASE_URL}/cfmpeg-linux-arm64"
+                sha256 "${LINUX_ARM64_SHA}"
+              else
+                url "${RELEASE_BASE_URL}/cfmpeg-linux-x64"
+                sha256 "${LINUX_X64_SHA}"
+              end
+            end
+
+            def install
+              binary = Dir["cfmpeg-*"].first || Dir["*"].find { |f| File.file?(f) }
+              raise "No cfmpeg binary found in staging directory" unless binary
+              bin.install binary => "cfmpeg"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/cfmpeg --version")
+            end
+          end
+          EOF
+
+          if git diff --quiet -- "$FORMULA_PATH"; then
+            echo "No Homebrew formula changes to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$FORMULA_PATH"
+          git commit -m "cfmpeg ${VERSION}"
+          git push origin main
+
+  smoke-test-homebrew:
+    needs:
+      - release
+      - release-binaries
+      - update-homebrew
+    runs-on: macos-latest
+    if: github.actor == 'aarondfrancis'
+    env:
+      VERSION: ${{ needs.release.outputs.version }}
+      REPOSITORY_OWNER: ${{ github.repository_owner }}
+
+    steps:
+      - name: Smoke test Homebrew install
+        run: |
+          set -euo pipefail
+
+          brew tap "${REPOSITORY_OWNER}/homebrew-tap"
+
+          for attempt in {1..8}; do
+            if brew list --versions cfmpeg >/dev/null 2>&1; then
+              brew upgrade "${REPOSITORY_OWNER}/homebrew-tap/cfmpeg" || true
+            else
+              brew install "${REPOSITORY_OWNER}/homebrew-tap/cfmpeg" || true
+            fi
+
+            INSTALLED_VERSION="$(brew list --versions cfmpeg 2>/dev/null | awk '{print $2}')"
+            if [ "$INSTALLED_VERSION" = "$VERSION" ]; then
+              break
+            fi
+
+            if [ "$attempt" -eq 8 ]; then
+              echo "Homebrew install failed after retries."
+              exit 1
+            fi
+
+            brew uninstall cfmpeg --force >/dev/null 2>&1 || true
+            sleep 15
+          done
+
+          cfmpeg --help >/dev/null
+          test "$(cfmpeg --version | awk 'NR==1 { print $2 }')" = "$VERSION"

@@ -41,7 +41,7 @@ pub async fn upload_file(
     let upload_result = if should_use_multipart(file_size, target) {
         multipart_upload(client, file_path, target, &progress).await
     } else {
-        direct_upload(client, file_path, &target.upload_url, &progress).await
+        direct_upload(client, file_path, target, &progress).await
     };
 
     match upload_result {
@@ -65,21 +65,38 @@ fn should_use_multipart(file_size: u64, target: &UploadTarget) -> bool {
 async fn direct_upload(
     client: &Client,
     file_path: &Path,
-    upload_url: &str,
+    target: &UploadTarget,
     progress: &ProgressBar,
 ) -> Result<()> {
     let data = tokio::fs::read(file_path).await?;
 
-    let response = client
-        .put(upload_url)
-        .header("Content-Type", "application/octet-stream")
-        .body(data.clone())
-        .send()
-        .await
-        .map_err(|error| CfmpegError::Upload {
-            filename: file_path.display().to_string(),
-            reason: error.to_string(),
-        })?;
+    let mut request = client.put(&target.upload_url);
+
+    for (name, value) in &target.headers {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+
+        request = request.header(name, value);
+    }
+
+    if !target
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("content-type"))
+    {
+        request = request.header("Content-Type", "application/octet-stream");
+    }
+
+    let response =
+        request
+            .body(data.clone())
+            .send()
+            .await
+            .map_err(|error| CfmpegError::Upload {
+                filename: file_path.display().to_string(),
+                reason: error.to_string(),
+            })?;
 
     if !response.status().is_success() {
         return Err(CfmpegError::Upload {

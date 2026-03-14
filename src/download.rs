@@ -27,13 +27,7 @@ pub async fn download_outputs(
 
     let mut requested_by_name: HashMap<String, PathBuf> = requested_outputs
         .iter()
-        .filter_map(|output| {
-            output
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| (name.to_string(), output.path.clone()))
-        })
+        .map(|output| (output.remote_name.clone(), output.path.clone()))
         .collect();
 
     for (index, remote_output) in remote_outputs.iter().enumerate() {

@@ -1,7 +1,9 @@
 use crate::config::Config;
 use crate::error::{CfmpegError, Result};
+use crate::remote::RemoteExecutionOptions;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub struct ApiClient {
@@ -15,6 +17,8 @@ pub struct CreateJobRequest {
     pub ffmpeg_args: Vec<String>,
     pub inputs: Vec<JobInput>,
     pub outputs: Vec<String>,
+    #[serde(skip_serializing_if = "RemoteExecutionOptions::is_empty")]
+    pub execution: RemoteExecutionOptions,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +43,8 @@ pub struct UploadTarget {
     pub method: String,
     pub part_size: u64,
     pub part_urls: Vec<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,11 +61,52 @@ pub struct JobStatus {
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Pending,
+    Queued,
     Uploading,
     Processing,
     Completed,
     Failed,
     Cancelled,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JobState, JobStatus, UploadTarget};
+
+    #[test]
+    fn deserializes_queued_job_status() {
+        let status: JobStatus = serde_json::from_str(
+            r#"{
+                "job_id": "job_123",
+                "status": "queued"
+            }"#,
+        )
+        .expect("queued status should deserialize");
+
+        assert!(matches!(status.status, JobState::Queued));
+    }
+
+    #[test]
+    fn deserializes_upload_headers() {
+        let target: UploadTarget = serde_json::from_str(
+            r#"{
+                "filename": "input.mov",
+                "upload_url": "https://example.com/upload",
+                "method": "direct",
+                "part_size": 123,
+                "part_urls": [],
+                "headers": {
+                    "x-test-header": "signed-value"
+                }
+            }"#,
+        )
+        .expect("upload target should deserialize");
+
+        assert_eq!(
+            target.headers.get("x-test-header").map(String::as_str),
+            Some("signed-value")
+        );
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -98,11 +145,17 @@ pub struct UsageResponse {
     pub gpu_minutes: f64,
     pub total_cost_cents: u64,
     pub jobs_count: u64,
+    #[serde(default)]
+    pub balance_millicents: i64,
+    #[serde(default = "default_currency")]
+    pub currency: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
     pub error: String,
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,13 +274,21 @@ impl ApiClient {
 
         let status_code = status.as_u16();
         let body = response.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<ApiErrorResponse>(&body)
-            .map(|error| error.error)
+        let parsed = serde_json::from_str::<ApiErrorResponse>(&body).ok();
+        let message = parsed
+            .as_ref()
+            .map(|error| error.error.clone())
             .unwrap_or(body);
+        let code = parsed.and_then(|error| error.code);
 
         Err(CfmpegError::Api {
             status: status_code,
+            code,
             message,
         })
     }
+}
+
+fn default_currency() -> String {
+    "usd".to_string()
 }

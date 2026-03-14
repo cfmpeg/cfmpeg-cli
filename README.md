@@ -18,7 +18,7 @@ No Docker. No Python. No cloud credentials. Install, authenticate, go.
 
 ```bash
 # macOS
-brew install cfmpeg
+brew install aarondfrancis/homebrew-tap/cfmpeg
 
 # Linux
 curl -fsSL https://cfmpeg.dev/install.sh | sh
@@ -35,9 +35,13 @@ cfmpeg auth login
 
 # Use it exactly like ffmpeg
 cfmpeg -i input.mov -c:v libx265 -crf 28 output.mp4
+
+# Request larger remote hardware without changing ffmpeg args
+cfmpeg --cf-profile gpu --cf-gpu required -i input.mov -c:v h264_nvenc output.mp4
 ```
 
 `cfmpeg auth login` opens the API key page and then prompts you to paste the key back into the CLI for local storage.
+If you request GPU execution, keep the video encoder on an NVENC codec such as `h264_nvenc`, `hevc_nvenc`, or `av1_nvenc`; the CLI will warn when the command selects a mode that will not use the remote GPU path.
 
 ## How It Works
 
@@ -84,6 +88,11 @@ Config lives at `~/.config/cfmpeg/config.toml`:
 api_key = "cfm_xxxxxxxxxxxx"
 api_base = "https://api.cfmpeg.dev/v1"
 local_fallback = true
+remote_profile = "highcpu"
+remote_cpu = 8
+remote_memory_mb = 16384
+remote_gpu = "off"
+remote_timeout_seconds = 5400
 ```
 
 ```bash
@@ -125,6 +134,10 @@ cargo build --locked
 ```
 
 The GitHub Actions workflow in `.github/workflows/ci.yml` runs the same checks on pushes and pull requests to `main`.
+
+## Releases
+
+Homebrew releases are published from GitHub Actions to `aarondfrancis/homebrew-tap` using the release workflows in `.github/workflows/`.
 
 ## License
 

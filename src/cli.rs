@@ -1,4 +1,8 @@
 use crate::error::{CfmpegError, Result};
+use crate::remote::{
+    parse_cpu_cores, parse_gpu_mode, parse_memory_mb, parse_profile, parse_timeout_seconds,
+    RemoteExecutionOptions,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -8,6 +12,7 @@ pub enum Command {
     Encode {
         ffmpeg_args: Vec<String>,
         force_local: bool,
+        remote: RemoteExecutionOptions,
     },
     Help,
     Usage,
@@ -47,7 +52,7 @@ pub fn print_help() {
     println!("cfmpeg");
     println!();
     println!("Usage:");
-    println!("  cfmpeg [--local] <ffmpeg args...>");
+    println!("  cfmpeg [--local] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-gpu <mode>] [--cf-timeout <duration>] <ffmpeg args...>");
     println!("  cfmpeg auth <login|status|logout>");
     println!("  cfmpeg config [path|show|edit]");
     println!("  cfmpeg usage");
@@ -58,6 +63,7 @@ pub fn print_help() {
     println!("Notes:");
     println!("  - Arguments that look like ffmpeg flags are passed through directly.");
     println!("  - Use `--local` to force local ffmpeg execution.");
+    println!("  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.");
     println!("  - Use `cfmpeg help` for CLI help because `-h` is treated as an ffmpeg flag.");
 }
 
@@ -110,14 +116,78 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     let mut show_codecs = false;
     let mut show_version = false;
     let mut ffmpeg_args = Vec::new();
+    let mut remote = RemoteExecutionOptions::default();
+    let mut index = 0usize;
 
-    for arg in raw_args {
+    while index < raw_args.len() {
+        let arg = &raw_args[index];
         match arg.as_str() {
             "--local" => force_local = true,
             "--codecs" => show_codecs = true,
             "--version" => show_version = true,
-            _ => ffmpeg_args.push(arg),
+            _ if arg.starts_with("--cf-profile=") => {
+                remote.profile = Some(parse_profile(value_after_equals(arg, "--cf-profile"))?);
+            }
+            "--cf-profile" => {
+                index += 1;
+                remote.profile = Some(parse_profile(value_after_flag(
+                    &raw_args,
+                    index,
+                    "--cf-profile",
+                )?)?);
+            }
+            _ if arg.starts_with("--cf-cpu=") => {
+                remote.cpu = Some(parse_cpu_cores(value_after_equals(arg, "--cf-cpu"))?);
+            }
+            "--cf-cpu" => {
+                index += 1;
+                remote.cpu = Some(parse_cpu_cores(value_after_flag(
+                    &raw_args, index, "--cf-cpu",
+                )?)?);
+            }
+            _ if arg.starts_with("--cf-memory=") => {
+                remote.memory_mb = Some(parse_memory_mb(value_after_equals(arg, "--cf-memory"))?);
+            }
+            "--cf-memory" => {
+                index += 1;
+                remote.memory_mb = Some(parse_memory_mb(value_after_flag(
+                    &raw_args,
+                    index,
+                    "--cf-memory",
+                )?)?);
+            }
+            _ if arg.starts_with("--cf-gpu=") => {
+                remote.gpu = Some(parse_gpu_mode(value_after_equals(arg, "--cf-gpu"))?);
+            }
+            "--cf-gpu" => {
+                index += 1;
+                remote.gpu = Some(parse_gpu_mode(value_after_flag(
+                    &raw_args, index, "--cf-gpu",
+                )?)?);
+            }
+            _ if arg.starts_with("--cf-timeout=") => {
+                remote.timeout_seconds = Some(parse_timeout_seconds(value_after_equals(
+                    arg,
+                    "--cf-timeout",
+                ))?);
+            }
+            "--cf-timeout" => {
+                index += 1;
+                remote.timeout_seconds = Some(parse_timeout_seconds(value_after_flag(
+                    &raw_args,
+                    index,
+                    "--cf-timeout",
+                )?)?);
+            }
+            _ if arg.starts_with("--cf-") => {
+                return Err(CfmpegError::ParseError(format!(
+                    "unknown remote execution flag: {arg}"
+                )));
+            }
+            _ => ffmpeg_args.push(arg.clone()),
         }
+
+        index += 1;
     }
 
     if show_codecs {
@@ -144,15 +214,35 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         return Ok(Command::Help);
     }
 
+    if force_local && !remote.is_empty() {
+        return Err(CfmpegError::ParseError(
+            "--cf-* flags cannot be used together with --local".to_string(),
+        ));
+    }
+
     Ok(Command::Encode {
         ffmpeg_args,
         force_local,
+        remote,
     })
+}
+
+fn value_after_equals<'a>(arg: &'a str, flag: &str) -> &'a str {
+    arg.split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("expected {flag}=..."))
+}
+
+fn value_after_flag<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
+    args.get(index)
+        .map(String::as_str)
+        .ok_or_else(|| CfmpegError::ParseError(format!("{flag} requires a value")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{parse_args, AuthAction, Command, ConfigAction};
+    use crate::remote::{RemoteExecutionOptions, GPU_REQUIRED, PROFILE_GPU};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -168,6 +258,40 @@ mod tests {
             Command::Encode {
                 ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
                 force_local: true,
+                remote: RemoteExecutionOptions::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_remote_execution_flags_separately_from_ffmpeg_args() {
+        let command = parse_args(args(&[
+            "--cf-profile",
+            "gpu",
+            "--cf-cpu=8",
+            "--cf-memory",
+            "16g",
+            "--cf-gpu",
+            "required",
+            "--cf-timeout=90m",
+            "-i",
+            "input.mov",
+            "output.mp4",
+        ]))
+        .expect("command");
+
+        assert_eq!(
+            command,
+            Command::Encode {
+                ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
+                force_local: false,
+                remote: RemoteExecutionOptions {
+                    profile: Some(PROFILE_GPU.to_string()),
+                    cpu: Some(8),
+                    memory_mb: Some(16 * 1024),
+                    gpu: Some(GPU_REQUIRED.to_string()),
+                    timeout_seconds: Some(90 * 60),
+                },
             }
         );
     }
@@ -191,5 +315,20 @@ mod tests {
         let error = parse_args(args(&["--codecs", "-i", "input.mov"])).expect_err("error");
 
         assert!(error.to_string().contains("--codecs"));
+    }
+
+    #[test]
+    fn rejects_remote_flags_with_local_mode() {
+        let error = parse_args(args(&[
+            "--local",
+            "--cf-cpu",
+            "8",
+            "-i",
+            "input.mov",
+            "output.mp4",
+        ]))
+        .expect_err("error");
+
+        assert!(error.to_string().contains("--cf-*"));
     }
 }
