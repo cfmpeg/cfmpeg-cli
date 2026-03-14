@@ -1,9 +1,11 @@
 use crate::config::Config;
 use crate::error::{CfmpegError, Result};
 use crate::remote::RemoteExecutionOptions;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 pub struct ApiClient {
@@ -43,8 +45,49 @@ pub struct UploadTarget {
     pub method: String,
     pub part_size: u64,
     pub part_urls: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_headers")]
     pub headers: HashMap<String, String>,
+}
+
+fn deserialize_headers<'de, D>(deserializer: D) -> std::result::Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct HeadersVisitor;
+
+    impl<'de> Visitor<'de> for HeadersVisitor {
+        type Value = HashMap<String, String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an object of header key/value pairs or an empty array")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut headers = HashMap::new();
+
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                headers.insert(key, value);
+            }
+
+            Ok(headers)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom("headers array must be empty"));
+            }
+
+            Ok(HashMap::new())
+        }
+    }
+
+    deserializer.deserialize_any(HeadersVisitor)
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,6 +149,23 @@ mod tests {
             target.headers.get("x-test-header").map(String::as_str),
             Some("signed-value")
         );
+    }
+
+    #[test]
+    fn deserializes_empty_upload_headers_array() {
+        let target: UploadTarget = serde_json::from_str(
+            r#"{
+                "filename": "input.mov",
+                "upload_url": "https://example.com/upload",
+                "method": "direct",
+                "part_size": 123,
+                "part_urls": [],
+                "headers": []
+            }"#,
+        )
+        .expect("empty header array should deserialize");
+
+        assert!(target.headers.is_empty());
     }
 }
 
