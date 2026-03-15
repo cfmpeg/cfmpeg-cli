@@ -22,7 +22,15 @@ pub async fn wait_for_completion(
     );
     progress.set_message("starting");
 
-    match stream_progress(api, http_client, job_id, &progress).await {
+    let result = if api.should_stream_progress() {
+        stream_progress(api, http_client, job_id, &progress).await
+    } else {
+        Err(CfmpegError::JobFailed(
+            "progress streaming disabled for loopback api hosts".to_string(),
+        ))
+    };
+
+    match result {
         Ok(()) => {
             progress.finish_with_message("done");
             Ok(())

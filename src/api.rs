@@ -1,8 +1,9 @@
 use crate::config::Config;
 use crate::error::{CfmpegError, Result};
 use crate::remote::RemoteExecutionOptions;
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use reqwest::Client;
+use reqwest::Url;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -49,7 +50,9 @@ pub struct UploadTarget {
     pub headers: HashMap<String, String>,
 }
 
-fn deserialize_headers<'de, D>(deserializer: D) -> std::result::Result<HashMap<String, String>, D::Error>
+fn deserialize_headers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -114,7 +117,7 @@ pub enum JobState {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobState, JobStatus, UploadTarget};
+    use super::{ApiClient, JobState, JobStatus, UploadTarget};
 
     #[test]
     fn deserializes_queued_job_status() {
@@ -166,6 +169,28 @@ mod tests {
         .expect("empty header array should deserialize");
 
         assert!(target.headers.is_empty());
+    }
+
+    #[test]
+    fn skips_streaming_progress_for_loopback_hosts() {
+        let client = ApiClient {
+            client: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            api_key: "cfm_testing".to_string(),
+        };
+
+        assert!(!client.should_stream_progress());
+    }
+
+    #[test]
+    fn streams_progress_for_remote_hosts() {
+        let client = ApiClient {
+            client: reqwest::Client::new(),
+            base_url: "https://api.cfmpeg.dev/v1".to_string(),
+            api_key: "cfm_testing".to_string(),
+        };
+
+        assert!(client.should_stream_progress());
     }
 }
 
@@ -284,6 +309,18 @@ impl ApiClient {
 
     pub fn stream_url(&self, job_id: &str) -> String {
         format!("{}/jobs/{job_id}/stream", self.base_url)
+    }
+
+    pub fn should_stream_progress(&self) -> bool {
+        let Ok(url) = Url::parse(&self.base_url) else {
+            return true;
+        };
+
+        let Some(host) = url.host_str() else {
+            return true;
+        };
+
+        !matches!(host, "127.0.0.1" | "localhost" | "::1")
     }
 
     pub fn api_key(&self) -> &str {
