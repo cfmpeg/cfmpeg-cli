@@ -139,7 +139,7 @@ pub enum JobState {
 mod tests {
     use super::{
         parse_error_response, ApiClient, CompletedMultipartPart, JobState, JobStatus,
-        StartJobRequest, UploadTarget,
+        ProgressEvent, StartJobRequest, UploadTarget,
     };
 
     #[test]
@@ -297,6 +297,26 @@ mod tests {
         assert!(message.ends_with("..."));
         assert_eq!(code, None);
     }
+
+    #[test]
+    fn deserializes_progress_event_error_message() {
+        let event: ProgressEvent = serde_json::from_str(
+            r#"{
+                "status": "failed",
+                "percent": 42,
+                "speed": "0.9x",
+                "error": "ffmpeg failed: no such filter"
+            }"#,
+        )
+        .expect("progress event should deserialize");
+
+        assert!(matches!(event.status, JobState::Failed));
+        assert_eq!(event.progress.percent, Some(42.0));
+        assert_eq!(
+            event.error.as_deref(),
+            Some("ffmpeg failed: no such filter")
+        );
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -395,6 +415,8 @@ pub struct ProgressEvent {
     #[serde(flatten)]
     pub progress: JobProgress,
     pub status: JobState,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl ApiClient {

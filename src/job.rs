@@ -9,6 +9,29 @@ use std::time::Duration;
 const JOB_TIMEOUT_SECS: u64 = 3600;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+enum StreamProgressOutcome {
+    Completed,
+    Failed(String),
+    Cancelled(String),
+}
+
+fn terminal_outcome(event: ProgressEvent) -> Option<StreamProgressOutcome> {
+    match event.status {
+        JobState::Completed => Some(StreamProgressOutcome::Completed),
+        JobState::Failed => Some(StreamProgressOutcome::Failed(
+            event
+                .error
+                .unwrap_or_else(|| "remote job failed".to_string()),
+        )),
+        JobState::Cancelled => Some(StreamProgressOutcome::Cancelled(
+            event
+                .error
+                .unwrap_or_else(|| "remote job was cancelled".to_string()),
+        )),
+        _ => None,
+    }
+}
+
 pub async fn wait_for_completion(
     api: &ApiClient,
     http_client: &Client,
@@ -22,19 +45,17 @@ pub async fn wait_for_completion(
     );
     progress.set_message("starting");
 
-    let result = if api.should_stream_progress() {
-        stream_progress(api, http_client, job_id, &progress).await
-    } else {
-        Err(CfmpegError::JobFailed(
-            "progress streaming disabled for loopback api hosts".to_string(),
-        ))
-    };
+    if !api.should_stream_progress() {
+        return poll_progress(api, job_id, &progress).await;
+    }
 
-    match result {
-        Ok(()) => {
+    match stream_progress(api, http_client, job_id, &progress).await {
+        Ok(StreamProgressOutcome::Completed) => {
             progress.finish_with_message("done");
             Ok(())
         }
+        Ok(StreamProgressOutcome::Failed(message)) => Err(CfmpegError::JobFailed(message)),
+        Ok(StreamProgressOutcome::Cancelled(message)) => Err(CfmpegError::JobFailed(message)),
         Err(_) => poll_progress(api, job_id, &progress).await,
     }
 }
@@ -44,7 +65,7 @@ async fn stream_progress(
     http_client: &Client,
     job_id: &str,
     progress: &ProgressBar,
-) -> Result<()> {
+) -> Result<StreamProgressOutcome> {
     let request = http_client
         .get(api.stream_url(job_id))
         .bearer_auth(api.api_key());
@@ -63,19 +84,8 @@ async fn stream_progress(
                 if let Ok(event) = serde_json::from_str::<ProgressEvent>(&message.data) {
                     update_progress_bar(progress, &event.progress);
 
-                    match event.status {
-                        JobState::Completed => return Ok(()),
-                        JobState::Failed => {
-                            return Err(CfmpegError::JobFailed(
-                                "remote job reported failure".to_string(),
-                            ));
-                        }
-                        JobState::Cancelled => {
-                            return Err(CfmpegError::JobFailed(
-                                "remote job was cancelled".to_string(),
-                            ));
-                        }
-                        _ => {}
+                    if let Some(outcome) = terminal_outcome(event) {
+                        return Ok(outcome);
                     }
                 }
             }
@@ -91,6 +101,42 @@ async fn stream_progress(
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{terminal_outcome, StreamProgressOutcome};
+    use crate::api::ProgressEvent;
+    use serde_json::json;
+
+    #[test]
+    fn uses_streamed_failure_error_message() {
+        let event: ProgressEvent = serde_json::from_value(json!({
+            "status": "failed",
+            "error": "ffmpeg failed: no such filter",
+        }))
+        .expect("progress event should deserialize");
+
+        let Some(StreamProgressOutcome::Failed(message)) = terminal_outcome(event) else {
+            panic!("failed jobs should produce a failed terminal outcome");
+        };
+
+        assert_eq!(message, "ffmpeg failed: no such filter");
+    }
+
+    #[test]
+    fn falls_back_to_generic_cancelled_message() {
+        let event: ProgressEvent = serde_json::from_value(json!({
+            "status": "cancelled",
+        }))
+        .expect("progress event should deserialize");
+
+        let Some(StreamProgressOutcome::Cancelled(message)) = terminal_outcome(event) else {
+            panic!("cancelled jobs should produce a cancelled terminal outcome");
+        };
+
+        assert_eq!(message, "remote job was cancelled");
     }
 }
 
