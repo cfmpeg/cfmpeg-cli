@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::error::{CfmpegError, Result};
 use crate::remote::RemoteExecutionOptions;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use reqwest::Url;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -117,7 +118,7 @@ pub enum JobState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiClient, JobState, JobStatus, UploadTarget};
+    use super::{parse_error_response, ApiClient, JobState, JobStatus, UploadTarget};
 
     #[test]
     fn deserializes_queued_job_status() {
@@ -192,6 +193,43 @@ mod tests {
 
         assert!(client.should_stream_progress());
     }
+
+    #[test]
+    fn prefers_json_api_errors() {
+        let (message, code) = parse_error_response(
+            422,
+            Some("application/json"),
+            r#"{"error":"The given data was invalid.","code":"validation_error"}"#,
+        );
+
+        assert_eq!(message, "The given data was invalid.");
+        assert_eq!(code.as_deref(), Some("validation_error"));
+    }
+
+    #[test]
+    fn summarizes_html_api_errors() {
+        let (message, code) = parse_error_response(
+            500,
+            Some("text/html; charset=UTF-8"),
+            "<!DOCTYPE html><html><body><h1>500</h1></body></html>",
+        );
+
+        assert_eq!(
+            message,
+            "server returned an HTML error page instead of JSON"
+        );
+        assert_eq!(code.as_deref(), Some("unexpected_html_response"));
+    }
+
+    #[test]
+    fn truncates_plain_text_api_errors() {
+        let long_body = "x".repeat(300);
+        let (message, code) = parse_error_response(500, Some("text/plain"), &long_body);
+
+        assert_eq!(message.len(), 243);
+        assert!(message.ends_with("..."));
+        assert_eq!(code, None);
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -241,6 +279,48 @@ struct ApiErrorResponse {
     pub error: String,
     #[serde(default)]
     pub code: Option<String>,
+}
+
+fn parse_error_response(
+    status_code: u16,
+    content_type: Option<&str>,
+    body: &str,
+) -> (String, Option<String>) {
+    if let Ok(parsed) = serde_json::from_str::<ApiErrorResponse>(body) {
+        return (parsed.error, parsed.code);
+    }
+
+    let trimmed = body.trim();
+    let is_html = content_type.is_some_and(|value| {
+        value.contains("text/html") || value.contains("application/xhtml+xml")
+    }) || trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<html");
+
+    if is_html {
+        let message = if status_code >= 500 {
+            "server returned an HTML error page instead of JSON".to_string()
+        } else {
+            "api returned an unexpected HTML response".to_string()
+        };
+
+        return (message, Some("unexpected_html_response".to_string()));
+    }
+
+    let single_line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("request failed");
+
+    (truncate_error_message(single_line, 240), None)
+}
+
+fn truncate_error_message(message: &str, max_len: usize) -> String {
+    if message.chars().count() <= max_len {
+        return message.to_string();
+    }
+
+    message.chars().take(max_len).collect::<String>() + "..."
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,13 +450,13 @@ impl ApiClient {
         }
 
         let status_code = status.as_u16();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let body = response.text().await.unwrap_or_default();
-        let parsed = serde_json::from_str::<ApiErrorResponse>(&body).ok();
-        let message = parsed
-            .as_ref()
-            .map(|error| error.error.clone())
-            .unwrap_or(body);
-        let code = parsed.and_then(|error| error.code);
+        let (message, code) = parse_error_response(status_code, content_type.as_deref(), &body);
 
         Err(CfmpegError::Api {
             status: status_code,
