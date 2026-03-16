@@ -235,6 +235,14 @@ async fn run_encode(
     }
 
     if !local_inputs.is_empty() {
+        if let Err(error) = api.prepare_job(&job.job_id).await {
+            eprintln!(
+                "  warning: remote worker warmup failed; continuing with the normal start path."
+            );
+            eprintln!("  note: {error}");
+            eprintln!();
+        }
+
         eprintln!();
         let mut multipart_uploads = Vec::new();
 

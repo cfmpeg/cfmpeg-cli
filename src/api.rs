@@ -444,6 +444,17 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
+    pub async fn prepare_job(&self, job_id: &str) -> Result<JobStatus> {
+        let response = self
+            .client
+            .post(format!("{}/jobs/{job_id}/prepare", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
     pub async fn get_job_status(&self, job_id: &str) -> Result<JobStatus> {
         let response = self
             .client
