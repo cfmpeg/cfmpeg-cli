@@ -57,9 +57,9 @@ pub struct JobIngest {
     #[serde(default)]
     pub stream_strategy: Option<String>,
     #[serde(default)]
-    pub chunk_size_bytes: Option<u64>,
+    pub segment_duration_seconds: Option<u64>,
     #[serde(default)]
-    pub chunk_uploads: Vec<ChunkUploadTarget>,
+    pub upload_target_url: Option<String>,
 }
 
 impl JobIngest {
@@ -80,16 +80,15 @@ impl Default for JobIngest {
             claim_url: None,
             input_format: None,
             stream_strategy: None,
-            chunk_size_bytes: None,
-            chunk_uploads: Vec::new(),
+            segment_duration_seconds: None,
+            upload_target_url: None,
         }
     }
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct ChunkUploadTarget {
+pub struct SegmentUploadTarget {
     pub index: u32,
-    pub size_bytes: u64,
     pub upload_url: String,
     #[serde(default, deserialize_with = "deserialize_headers")]
     pub headers: HashMap<String, String>,
@@ -111,6 +110,11 @@ pub struct UploadTarget {
 pub struct StartJobRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub multipart_uploads: Vec<CompletedMultipartUpload>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompleteIngestRequest {
+    pub segment_count: u32,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -367,34 +371,19 @@ mod tests {
                 "uploads": [],
                 "ingest": {
                     "mode": "segmented_upload",
-                    "chunk_size_bytes": 64,
-                    "chunk_uploads": [
-                        {
-                            "index": 0,
-                            "size_bytes": 64,
-                            "upload_url": "https://uploads.example.test/chunk-0",
-                            "headers": {
-                                "x-test": "1"
-                            }
-                        },
-                        {
-                            "index": 1,
-                            "size_bytes": 32,
-                            "upload_url": "https://uploads.example.test/chunk-1",
-                            "headers": {
-                                "x-test": "1"
-                            }
-                        }
-                    ]
+                    "segment_duration_seconds": 90,
+                    "upload_target_url": "https://api.example.test/v1/jobs/job_123/ingest/segments/0/upload-target"
                 }
             }"#,
         )
         .expect("segmented ingest response should deserialize");
 
         assert!(response.ingest.is_segmented_upload());
-        assert_eq!(response.ingest.chunk_size_bytes, Some(64));
-        assert_eq!(response.ingest.chunk_uploads.len(), 2);
-        assert_eq!(response.ingest.chunk_uploads[1].size_bytes, 32);
+        assert_eq!(response.ingest.segment_duration_seconds, Some(90));
+        assert_eq!(
+            response.ingest.upload_target_url.as_deref(),
+            Some("https://api.example.test/v1/jobs/job_123/ingest/segments/0/upload-target")
+        );
     }
 
     #[test]
@@ -613,11 +602,34 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
-    pub async fn complete_segmented_ingest(&self, job_id: &str) -> Result<JobStatus> {
+    pub async fn request_segment_upload_target(
+        &self,
+        job_id: &str,
+        index: u32,
+    ) -> Result<SegmentUploadTarget> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/jobs/{job_id}/ingest/segments/{index}/upload-target",
+                self.base_url
+            ))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn complete_segmented_ingest(
+        &self,
+        job_id: &str,
+        request: &CompleteIngestRequest,
+    ) -> Result<JobStatus> {
         let response = self
             .client
             .post(format!("{}/jobs/{job_id}/ingest/complete", self.base_url))
             .bearer_auth(&self.api_key)
+            .json(request)
             .send()
             .await?;
 

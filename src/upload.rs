@@ -1,13 +1,17 @@
-use crate::api::{CompletedMultipartPart, JobIngest, UploadTarget};
+use crate::api::{ApiClient, CompletedMultipartPart, JobIngest, SegmentUploadTarget, UploadTarget};
 use crate::error::{CfmpegError, Result};
+use crate::media_tools::ffmpeg_binary;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::{HeaderMap, ETAG};
 use reqwest::Client;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::process::Command;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const MIN_CONCURRENT_UPLOADS: usize = 6;
 const MAX_CONCURRENT_UPLOADS: usize = 24;
@@ -15,6 +19,21 @@ const MAX_RETRIES: u32 = 3;
 
 pub struct UploadResult {
     pub multipart_parts: Vec<CompletedMultipartPart>,
+}
+
+struct SegmentUploadContext<'a> {
+    api: &'a ApiClient,
+    client: &'a Client,
+    job_id: &'a str,
+    segment_dir: &'a Path,
+    progress: &'a ProgressBar,
+    total_bytes: u64,
+}
+
+#[derive(Default)]
+struct SegmentUploadState {
+    next_upload_index: u32,
+    uploaded_bytes: u64,
 }
 
 pub async fn upload_file(
@@ -60,17 +79,19 @@ pub async fn upload_file(
 }
 
 pub async fn upload_segmented_file(
+    api: &ApiClient,
     client: &Client,
     file_path: &Path,
+    job_id: &str,
     ingest: &JobIngest,
-) -> Result<()> {
-    let chunk_size = ingest.chunk_size_bytes.ok_or_else(|| {
-        CfmpegError::Protocol("segmented uploads require chunk_size_bytes".to_string())
+) -> Result<u32> {
+    let segment_duration_seconds = ingest.segment_duration_seconds.ok_or_else(|| {
+        CfmpegError::Protocol("segmented uploads require segment_duration_seconds".to_string())
     })? as usize;
 
-    if ingest.chunk_uploads.is_empty() {
+    if segment_duration_seconds == 0 {
         return Err(CfmpegError::Protocol(
-            "segmented uploads require chunk upload targets".to_string(),
+            "segmented uploads require a positive segment duration".to_string(),
         ));
     }
 
@@ -89,102 +110,175 @@ pub async fn upload_segmented_file(
     );
     progress.set_message(filename.clone());
 
-    let uploaded_bytes = Arc::new(Mutex::new(0u64));
-    let concurrency = multipart_upload_concurrency(ingest.chunk_uploads.len(), file_size);
+    let ffmpeg = ffmpeg_binary()?;
+    let segment_dir = std::env::temp_dir().join(format!("cfmpeg-segments-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&segment_dir).await?;
+    let segment_template = segment_dir.join("segment_%06d.mp4");
 
-    let results: Vec<Result<()>> = stream::iter(ingest.chunk_uploads.iter().cloned())
-        .map(|target| {
-            let client = client.clone();
-            let file_path = file_path.to_path_buf();
-            let uploaded_bytes = Arc::clone(&uploaded_bytes);
-            let progress = progress.clone();
+    let mut segmenter = Command::new(ffmpeg);
+    segmenter
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-i")
+        .arg(file_path)
+        .arg("-c")
+        .arg("copy")
+        .arg("-map")
+        .arg("0")
+        .arg("-f")
+        .arg("segment")
+        .arg("-segment_time")
+        .arg(segment_duration_seconds.to_string())
+        .arg("-reset_timestamps")
+        .arg("1")
+        .arg(segment_template.as_os_str())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
 
-            async move {
-                let chunk = read_chunk(&file_path, file_size, target.index as usize, chunk_size).await?;
-                let chunk_size_bytes = chunk.len() as u64;
+    let mut child = segmenter.spawn()?;
+    let mut state = SegmentUploadState::default();
+    let context = SegmentUploadContext {
+        api,
+        client,
+        job_id,
+        segment_dir: &segment_dir,
+        progress: &progress,
+        total_bytes: file_size,
+    };
 
-                if chunk_size_bytes != target.size_bytes {
-                    return Err(CfmpegError::Protocol(format!(
-                        "api expected chunk {} to be {} bytes, but the local file produced {} bytes",
-                        target.index, target.size_bytes, chunk_size_bytes
-                    )));
-                }
+    loop {
+        upload_closed_segments(&context, &mut state, false).await?;
 
-                for attempt in 0..MAX_RETRIES {
-                    let mut request = client.put(&target.upload_url);
+        if child.try_wait()?.is_some() {
+            break;
+        }
 
-                    for (name, value) in &target.headers {
-                        if name.eq_ignore_ascii_case("host") {
-                            continue;
-                        }
-
-                        request = request.header(name, value);
-                    }
-
-                    if !target
-                        .headers
-                        .keys()
-                        .any(|name| name.eq_ignore_ascii_case("content-type"))
-                    {
-                        request = request.header("Content-Type", "application/octet-stream");
-                    }
-
-                    let response = request.body(chunk.clone()).send().await;
-
-                    match response {
-                        Ok(response) if response.status().is_success() => {
-                            let mut uploaded = uploaded_bytes.lock().await;
-                            *uploaded += chunk_size_bytes;
-                            progress.set_position(*uploaded);
-                            return Ok(());
-                        }
-                        Ok(response) => {
-                            if attempt == MAX_RETRIES - 1 {
-                                return Err(CfmpegError::Upload {
-                                    filename: file_path.display().to_string(),
-                                    reason: format!(
-                                        "chunk {} failed with status {}",
-                                        target.index,
-                                        response.status()
-                                    ),
-                                });
-                            }
-                        }
-                        Err(error) => {
-                            if attempt == MAX_RETRIES - 1 {
-                                return Err(CfmpegError::Upload {
-                                    filename: file_path.display().to_string(),
-                                    reason: format!("chunk {} failed: {error}", target.index),
-                                });
-                            }
-                        }
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt)))
-                        .await;
-                }
-
-                Err(CfmpegError::Upload {
-                    filename: file_path.display().to_string(),
-                    reason: format!("chunk {} failed after retries", target.index),
-                })
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
-
-    for result in results {
-        result?;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+
+    let output = child.wait_with_output().await?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = tokio::fs::remove_dir_all(&segment_dir).await;
+        progress.abandon_with_message(filename);
+        return Err(CfmpegError::Upload {
+            filename: file_path.display().to_string(),
+            reason: if detail.is_empty() {
+                format!("segmenter exited with status {}", output.status)
+            } else {
+                detail
+            },
+        });
+    }
+
+    upload_closed_segments(&context, &mut state, true).await?;
+
+    let _ = tokio::fs::remove_dir_all(&segment_dir).await;
 
     progress.finish_with_message(filename);
 
-    Ok(())
+    Ok(state.next_upload_index)
 }
 
 fn should_use_multipart(target: &UploadTarget) -> bool {
     target.method.eq_ignore_ascii_case("multipart") && !target.part_urls.is_empty()
+}
+
+async fn upload_closed_segments(
+    context: &SegmentUploadContext<'_>,
+    state: &mut SegmentUploadState,
+    include_last_segment: bool,
+) -> Result<()> {
+    loop {
+        let current_path = segment_file_path(context.segment_dir, state.next_upload_index);
+        if !current_path.exists() {
+            return Ok(());
+        }
+
+        let next_path = segment_file_path(context.segment_dir, state.next_upload_index + 1);
+        if !include_last_segment && !next_path.exists() {
+            return Ok(());
+        }
+
+        let target = context
+            .api
+            .request_segment_upload_target(context.job_id, state.next_upload_index)
+            .await?;
+        let bytes_uploaded =
+            upload_segment_file(context.client, &current_path, &target, &current_path).await?;
+
+        state.uploaded_bytes = (state.uploaded_bytes + bytes_uploaded).min(context.total_bytes);
+        context.progress.set_position(state.uploaded_bytes);
+        tokio::fs::remove_file(&current_path).await?;
+        state.next_upload_index += 1;
+    }
+}
+
+fn segment_file_path(segment_dir: &Path, index: u32) -> PathBuf {
+    segment_dir.join(format!("segment_{index:06}.mp4"))
+}
+
+async fn upload_segment_file(
+    client: &Client,
+    file_path: &Path,
+    target: &SegmentUploadTarget,
+    display_path: &Path,
+) -> Result<u64> {
+    let data = tokio::fs::read(file_path).await?;
+
+    for attempt in 0..MAX_RETRIES {
+        let mut request = client.put(&target.upload_url);
+
+        for (name, value) in &target.headers {
+            if name.eq_ignore_ascii_case("host") {
+                continue;
+            }
+
+            request = request.header(name, value);
+        }
+
+        if !target
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-type"))
+        {
+            request = request.header("Content-Type", "video/mp4");
+        }
+
+        match request.body(data.clone()).send().await {
+            Ok(response) if response.status().is_success() => return Ok(data.len() as u64),
+            Ok(response) => {
+                if attempt == MAX_RETRIES - 1 {
+                    return Err(CfmpegError::Upload {
+                        filename: display_path.display().to_string(),
+                        reason: format!(
+                            "segment {} failed with status {}",
+                            target.index,
+                            response.status()
+                        ),
+                    });
+                }
+            }
+            Err(error) => {
+                if attempt == MAX_RETRIES - 1 {
+                    return Err(CfmpegError::Upload {
+                        filename: display_path.display().to_string(),
+                        reason: format!("segment {} failed: {error}", target.index),
+                    });
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt))).await;
+    }
+
+    Err(CfmpegError::Upload {
+        filename: display_path.display().to_string(),
+        reason: format!("segment {} failed after retries", target.index),
+    })
 }
 
 async fn direct_upload(

@@ -13,7 +13,8 @@ mod stream;
 mod upload;
 
 use crate::api::{
-    ApiClient, CompletedMultipartUpload, CreateJobRequest, JobInput, StartJobRequest,
+    ApiClient, CompleteIngestRequest, CompletedMultipartUpload, CreateJobRequest, JobInput,
+    StartJobRequest,
 };
 use crate::cli::{AuthAction, Command, ConfigAction};
 use crate::config::Config;
@@ -277,6 +278,9 @@ async fn run_encode(
                 "segmented upload jobs require exactly one local input".to_string(),
             ));
         };
+        let _upload_target_url = job.ingest.upload_target_url.as_deref().ok_or_else(|| {
+            CfmpegError::Protocol("segmented uploads require an upload target endpoint".to_string())
+        })?;
 
         eprintln!(
             "  {} segmented ingest enabled for this job",
@@ -285,9 +289,12 @@ async fn run_encode(
         eprintln!();
 
         api.prepare_job(&job.job_id).await?;
-        upload::upload_segmented_file(&http_client, input_path, &job.ingest).await?;
+        let segment_count =
+            upload::upload_segmented_file(&api, &http_client, input_path, &job.job_id, &job.ingest)
+                .await?;
         eprintln!();
-        api.complete_segmented_ingest(&job.job_id).await?;
+        api.complete_segmented_ingest(&job.job_id, &CompleteIngestRequest { segment_count })
+            .await?;
         job::wait_for_completion(&api, &http_client, &job.job_id).await?;
     } else {
         if !local_inputs.is_empty() {
