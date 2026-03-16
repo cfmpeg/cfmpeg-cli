@@ -19,6 +19,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FFMPEG_HELPER_VERSION: "8.0"
 
 jobs:
   build-binaries:
@@ -62,17 +63,23 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Build bundled ffmpeg helpers
+        run: bash scripts/build-helper-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-helper"
+
       - name: Prepare release assets
         run: |
-          mkdir -p release
-          cp target/release/cfmpeg "release/${{ matrix.asset_name }}"
-          chmod +x "release/${{ matrix.asset_name }}"
-          shasum -a 256 "release/${{ matrix.asset_name }}" > "release/${{ matrix.asset_name }}.sha256"
+          mkdir -p release/bundle/bin release/bundle/libexec
+          cp target/release/cfmpeg release/bundle/bin/cfmpeg
+          cp "$RUNNER_TEMP/ffmpeg-helper/bin/ffmpeg" release/bundle/libexec/ffmpeg
+          cp "$RUNNER_TEMP/ffmpeg-helper/bin/ffprobe" release/bundle/libexec/ffprobe
+          chmod +x release/bundle/bin/cfmpeg release/bundle/libexec/ffmpeg release/bundle/libexec/ffprobe
+          tar -czf "release/${{ matrix.asset_name }}.tar.gz" -C release/bundle .
+          shasum -a 256 "release/${{ matrix.asset_name }}.tar.gz" > "release/${{ matrix.asset_name }}.tar.gz.sha256"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.value }}
           files: |
-            release/${{ matrix.asset_name }}
-            release/${{ matrix.asset_name }}.sha256
+            release/${{ matrix.asset_name }}.tar.gz
+            release/${{ matrix.asset_name }}.tar.gz.sha256

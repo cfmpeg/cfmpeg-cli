@@ -1,5 +1,6 @@
 use crate::api::{parse_error_response, JobIngest};
 use crate::error::{CfmpegError, Result};
+use crate::media_tools;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use std::path::Path;
@@ -32,7 +33,8 @@ pub async fn stream_input(client: &Client, ingest: &JobIngest, input_path: &Path
             handle_stream_response(client, stream_url, claim_url, content_type, body).await
         }
         "copy_remux" => {
-            let mut child = Command::new("ffmpeg")
+            let ffmpeg_binary = media_tools::ffmpeg_binary()?;
+            let mut child = Command::new(ffmpeg_binary)
                 .arg("-hide_banner")
                 .arg("-loglevel")
                 .arg("error")

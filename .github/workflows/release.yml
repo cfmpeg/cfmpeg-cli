@@ -130,6 +130,10 @@ jobs:
           TAP_DIR="$(mktemp -d)"
           FORMULA_PATH="Formula/cfmpeg.rb"
           RELEASE_BASE_URL="https://github.com/${REPOSITORY}/releases/download/v${VERSION}"
+          DARWIN_ARM64_ARCHIVE="cfmpeg-darwin-arm64.tar.gz"
+          DARWIN_X64_ARCHIVE="cfmpeg-darwin-x64.tar.gz"
+          LINUX_ARM64_ARCHIVE="cfmpeg-linux-arm64.tar.gz"
+          LINUX_X64_ARCHIVE="cfmpeg-linux-x64.tar.gz"
 
           read_sha() {
             local name="$1"
@@ -150,10 +154,10 @@ jobs:
             done
           }
 
-          DARWIN_ARM64_SHA="$(read_sha cfmpeg-darwin-arm64)"
-          DARWIN_X64_SHA="$(read_sha cfmpeg-darwin-x64)"
-          LINUX_ARM64_SHA="$(read_sha cfmpeg-linux-arm64)"
-          LINUX_X64_SHA="$(read_sha cfmpeg-linux-x64)"
+          DARWIN_ARM64_SHA="$(read_sha "${DARWIN_ARM64_ARCHIVE}")"
+          DARWIN_X64_SHA="$(read_sha "${DARWIN_X64_ARCHIVE}")"
+          LINUX_ARM64_SHA="$(read_sha "${LINUX_ARM64_ARCHIVE}")"
+          LINUX_X64_SHA="$(read_sha "${LINUX_X64_ARCHIVE}")"
 
           for hash in "$DARWIN_ARM64_SHA" "$DARWIN_X64_SHA" "$LINUX_ARM64_SHA" "$LINUX_X64_SHA"; do
             if ! [[ "$hash" =~ ^[a-f0-9]{64}$ ]]; then
@@ -174,32 +178,33 @@ jobs:
 
             on_macos do
               if Hardware::CPU.arm?
-                url "${RELEASE_BASE_URL}/cfmpeg-darwin-arm64"
+                url "${RELEASE_BASE_URL}/${DARWIN_ARM64_ARCHIVE}"
                 sha256 "${DARWIN_ARM64_SHA}"
               else
-                url "${RELEASE_BASE_URL}/cfmpeg-darwin-x64"
+                url "${RELEASE_BASE_URL}/${DARWIN_X64_ARCHIVE}"
                 sha256 "${DARWIN_X64_SHA}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "${RELEASE_BASE_URL}/cfmpeg-linux-arm64"
+                url "${RELEASE_BASE_URL}/${LINUX_ARM64_ARCHIVE}"
                 sha256 "${LINUX_ARM64_SHA}"
               else
-                url "${RELEASE_BASE_URL}/cfmpeg-linux-x64"
+                url "${RELEASE_BASE_URL}/${LINUX_X64_ARCHIVE}"
                 sha256 "${LINUX_X64_SHA}"
               end
             end
 
             def install
-              binary = Dir["cfmpeg-*"].first || Dir["*"].find { |f| File.file?(f) }
-              raise "No cfmpeg binary found in staging directory" unless binary
-              bin.install binary => "cfmpeg"
+              bin.install "bin/cfmpeg"
+              libexec.install "libexec/ffmpeg", "libexec/ffprobe"
             end
 
             test do
               assert_match version.to_s, shell_output("#{bin}/cfmpeg --version")
+              assert_predicate libexec/"ffmpeg", :exist?
+              assert_predicate libexec/"ffprobe", :exist?
             end
           end
           EOF

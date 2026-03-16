@@ -6,6 +6,7 @@ mod download;
 mod error;
 mod fallback;
 mod job;
+mod media_tools;
 mod parser;
 mod remote;
 mod stream;

@@ -27,6 +27,9 @@ curl -fsSL https://cfmpeg.dev/install.sh | sh
 cargo install cfmpeg
 ```
 
+Prebuilt releases bundle helper `ffmpeg` and `ffprobe` binaries for cfmpeg's internal remuxing and future media segmentation paths.
+If you install from source instead, keep `ffmpeg` available on `PATH` or point cfmpeg at an explicit helper with `CFMPEG_FFMPEG_BINARY`.
+
 ## Quick Start
 
 ```bash

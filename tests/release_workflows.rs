@@ -16,6 +16,9 @@ fn release_binaries_workflow_builds_all_homebrew_assets() {
     assert!(workflow.contains("cfmpeg-darwin-x64"));
     assert!(workflow.contains("cfmpeg-linux-arm64"));
     assert!(workflow.contains("cfmpeg-linux-x64"));
+    assert!(workflow.contains("${{ matrix.asset_name }}.tar.gz"));
+    assert!(workflow.contains("build-helper-ffmpeg.sh"));
+    assert!(workflow.contains("release/bundle/libexec/ffmpeg"));
     assert!(workflow.contains("softprops/action-gh-release@v2"));
 }
 
@@ -28,4 +31,5 @@ fn release_workflow_updates_the_homebrew_tap() {
     assert!(workflow.contains("homebrew-tap"));
     assert!(workflow.contains("brew install"));
     assert!(workflow.contains("cfmpeg --version"));
+    assert!(workflow.contains("libexec.install \"libexec/ffmpeg\", \"libexec/ffprobe\""));
 }
