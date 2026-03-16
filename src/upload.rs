@@ -41,7 +41,7 @@ pub async fn upload_file(
     });
 
     let upload_result = if should_use_multipart(target) {
-        multipart_upload(client, file_path, target, &progress).await
+        multipart_upload(client, file_path, file_size, target, &progress).await
     } else {
         direct_upload(client, file_path, target, &progress).await
     };
@@ -115,6 +115,7 @@ async fn direct_upload(
 async fn multipart_upload(
     client: &Client,
     file_path: &Path,
+    file_size: u64,
     target: &UploadTarget,
     progress: &ProgressBar,
 ) -> Result<UploadResult> {
@@ -135,7 +136,7 @@ async fn multipart_upload(
             let progress = progress.clone();
 
             async move {
-                let chunk = read_chunk(&file_path, part_index, part_size).await?;
+                let chunk = read_chunk(&file_path, file_size, part_index, part_size).await?;
                 let chunk_size = chunk.len() as u64;
 
                 for attempt in 0..MAX_RETRIES {
@@ -215,17 +216,35 @@ async fn multipart_upload(
     })
 }
 
-async fn read_chunk(file_path: &PathBuf, part_index: usize, part_size: usize) -> Result<Vec<u8>> {
+async fn read_chunk(
+    file_path: &PathBuf,
+    file_size: u64,
+    part_index: usize,
+    part_size: usize,
+) -> Result<Vec<u8>> {
     let mut file = tokio::fs::File::open(file_path).await?;
     let start = (part_index * part_size) as u64;
+    let chunk_size = chunk_size_for_part(file_size, part_index, part_size)?;
 
     file.seek(std::io::SeekFrom::Start(start)).await?;
 
-    let mut chunk = vec![0; part_size];
-    let bytes_read = file.read(&mut chunk).await?;
-    chunk.truncate(bytes_read);
+    let mut chunk = vec![0; chunk_size];
+    file.read_exact(&mut chunk).await?;
 
     Ok(chunk)
+}
+
+fn chunk_size_for_part(file_size: u64, part_index: usize, part_size: usize) -> Result<usize> {
+    let start = (part_index * part_size) as u64;
+
+    if start >= file_size {
+        return Err(CfmpegError::Upload {
+            filename: "input".to_string(),
+            reason: format!("part {} starts past end of file", part_index + 1),
+        });
+    }
+
+    Ok(((file_size - start) as usize).min(part_size))
 }
 
 fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
@@ -237,7 +256,7 @@ fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_multipart_etag;
+    use super::{chunk_size_for_part, extract_multipart_etag};
     use reqwest::header::{HeaderMap, HeaderValue, ETAG};
 
     #[test]
@@ -256,5 +275,21 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert_eq!(extract_multipart_etag(&headers), None);
+    }
+
+    #[test]
+    fn computes_full_chunk_sizes_for_non_final_parts() {
+        assert_eq!(
+            chunk_size_for_part(25 * 1024 * 1024, 0, 10 * 1024 * 1024).unwrap(),
+            10 * 1024 * 1024
+        );
+        assert_eq!(
+            chunk_size_for_part(25 * 1024 * 1024, 1, 10 * 1024 * 1024).unwrap(),
+            10 * 1024 * 1024
+        );
+        assert_eq!(
+            chunk_size_for_part(25 * 1024 * 1024, 2, 10 * 1024 * 1024).unwrap(),
+            5 * 1024 * 1024
+        );
     }
 }
