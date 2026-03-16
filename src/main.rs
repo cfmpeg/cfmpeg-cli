@@ -231,7 +231,10 @@ async fn run_encode(
         })
         .collect();
 
-    if !job.ingest.is_direct_stream() && job.uploads.len() < local_inputs.len() {
+    if !job.ingest.is_direct_stream()
+        && !job.ingest.is_segmented_upload()
+        && job.uploads.len() < local_inputs.len()
+    {
         return Err(CfmpegError::Protocol(
             "api returned fewer upload targets than local inputs".to_string(),
         ));
@@ -267,6 +270,24 @@ async fn run_encode(
         monitor.await.map_err(|error| {
             CfmpegError::JobFailed(format!("job monitor task failed: {error}"))
         })??;
+    } else if job.ingest.is_segmented_upload() {
+        let [input_path] = local_inputs.as_slice() else {
+            return Err(CfmpegError::Protocol(
+                "segmented upload jobs require exactly one local input".to_string(),
+            ));
+        };
+
+        eprintln!(
+            "  {} segmented ingest enabled for this job",
+            style("->").cyan()
+        );
+        eprintln!();
+
+        api.prepare_job(&job.job_id).await?;
+        upload::upload_segmented_file(&http_client, input_path, &job.ingest).await?;
+        eprintln!();
+        api.complete_segmented_ingest(&job.job_id).await?;
+        job::wait_for_completion(&api, &http_client, &job.job_id).await?;
     } else {
         if !local_inputs.is_empty() {
             if let Err(error) = api.prepare_job(&job.job_id).await {

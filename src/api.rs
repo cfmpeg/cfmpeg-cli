@@ -56,11 +56,19 @@ pub struct JobIngest {
     pub input_format: Option<String>,
     #[serde(default)]
     pub stream_strategy: Option<String>,
+    #[serde(default)]
+    pub chunk_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub chunk_uploads: Vec<ChunkUploadTarget>,
 }
 
 impl JobIngest {
     pub fn is_direct_stream(&self) -> bool {
         self.mode == "direct_stream"
+    }
+
+    pub fn is_segmented_upload(&self) -> bool {
+        self.mode == "segmented_upload"
     }
 }
 
@@ -72,8 +80,19 @@ impl Default for JobIngest {
             claim_url: None,
             input_format: None,
             stream_strategy: None,
+            chunk_size_bytes: None,
+            chunk_uploads: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChunkUploadTarget {
+    pub index: u32,
+    pub size_bytes: u64,
+    pub upload_url: String,
+    #[serde(default, deserialize_with = "deserialize_headers")]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -341,6 +360,44 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_segmented_ingest_targets() {
+        let response: CreateJobResponse = serde_json::from_str(
+            r#"{
+                "job_id": "job_123",
+                "uploads": [],
+                "ingest": {
+                    "mode": "segmented_upload",
+                    "chunk_size_bytes": 64,
+                    "chunk_uploads": [
+                        {
+                            "index": 0,
+                            "size_bytes": 64,
+                            "upload_url": "https://uploads.example.test/chunk-0",
+                            "headers": {
+                                "x-test": "1"
+                            }
+                        },
+                        {
+                            "index": 1,
+                            "size_bytes": 32,
+                            "upload_url": "https://uploads.example.test/chunk-1",
+                            "headers": {
+                                "x-test": "1"
+                            }
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("segmented ingest response should deserialize");
+
+        assert!(response.ingest.is_segmented_upload());
+        assert_eq!(response.ingest.chunk_size_bytes, Some(64));
+        assert_eq!(response.ingest.chunk_uploads.len(), 2);
+        assert_eq!(response.ingest.chunk_uploads[1].size_bytes, 32);
+    }
+
+    #[test]
     fn prefers_json_api_errors() {
         let (message, code) = parse_error_response(
             422,
@@ -549,6 +606,17 @@ impl ApiClient {
         let response = self
             .client
             .post(format!("{}/jobs/{job_id}/prepare", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn complete_segmented_ingest(&self, job_id: &str) -> Result<JobStatus> {
+        let response = self
+            .client
+            .post(format!("{}/jobs/{job_id}/ingest/complete", self.base_url))
             .bearer_auth(&self.api_key)
             .send()
             .await?;

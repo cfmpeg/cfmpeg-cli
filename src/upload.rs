@@ -1,4 +1,4 @@
-use crate::api::{CompletedMultipartPart, UploadTarget};
+use crate::api::{CompletedMultipartPart, JobIngest, UploadTarget};
 use crate::error::{CfmpegError, Result};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -57,6 +57,130 @@ pub async fn upload_file(
             Err(error)
         }
     }
+}
+
+pub async fn upload_segmented_file(
+    client: &Client,
+    file_path: &Path,
+    ingest: &JobIngest,
+) -> Result<()> {
+    let chunk_size = ingest.chunk_size_bytes.ok_or_else(|| {
+        CfmpegError::Protocol("segmented uploads require chunk_size_bytes".to_string())
+    })? as usize;
+
+    if ingest.chunk_uploads.is_empty() {
+        return Err(CfmpegError::Protocol(
+            "segmented uploads require chunk upload targets".to_string(),
+        ));
+    }
+
+    let file_size = std::fs::metadata(file_path)?.len();
+    let filename = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("input")
+        .to_string();
+
+    let progress = ProgressBar::new(file_size);
+    progress.set_style(
+        ProgressStyle::with_template("  Uploading {msg} {bar:40.cyan/blue} {bytes}/{total_bytes}")
+            .expect("progress template")
+            .progress_chars("##-"),
+    );
+    progress.set_message(filename.clone());
+
+    let uploaded_bytes = Arc::new(Mutex::new(0u64));
+    let concurrency = multipart_upload_concurrency(ingest.chunk_uploads.len(), file_size);
+
+    let results: Vec<Result<()>> = stream::iter(ingest.chunk_uploads.iter().cloned())
+        .map(|target| {
+            let client = client.clone();
+            let file_path = file_path.to_path_buf();
+            let uploaded_bytes = Arc::clone(&uploaded_bytes);
+            let progress = progress.clone();
+
+            async move {
+                let chunk = read_chunk(&file_path, file_size, target.index as usize, chunk_size).await?;
+                let chunk_size_bytes = chunk.len() as u64;
+
+                if chunk_size_bytes != target.size_bytes {
+                    return Err(CfmpegError::Protocol(format!(
+                        "api expected chunk {} to be {} bytes, but the local file produced {} bytes",
+                        target.index, target.size_bytes, chunk_size_bytes
+                    )));
+                }
+
+                for attempt in 0..MAX_RETRIES {
+                    let mut request = client.put(&target.upload_url);
+
+                    for (name, value) in &target.headers {
+                        if name.eq_ignore_ascii_case("host") {
+                            continue;
+                        }
+
+                        request = request.header(name, value);
+                    }
+
+                    if !target
+                        .headers
+                        .keys()
+                        .any(|name| name.eq_ignore_ascii_case("content-type"))
+                    {
+                        request = request.header("Content-Type", "application/octet-stream");
+                    }
+
+                    let response = request.body(chunk.clone()).send().await;
+
+                    match response {
+                        Ok(response) if response.status().is_success() => {
+                            let mut uploaded = uploaded_bytes.lock().await;
+                            *uploaded += chunk_size_bytes;
+                            progress.set_position(*uploaded);
+                            return Ok(());
+                        }
+                        Ok(response) => {
+                            if attempt == MAX_RETRIES - 1 {
+                                return Err(CfmpegError::Upload {
+                                    filename: file_path.display().to_string(),
+                                    reason: format!(
+                                        "chunk {} failed with status {}",
+                                        target.index,
+                                        response.status()
+                                    ),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            if attempt == MAX_RETRIES - 1 {
+                                return Err(CfmpegError::Upload {
+                                    filename: file_path.display().to_string(),
+                                    reason: format!("chunk {} failed: {error}", target.index),
+                                });
+                            }
+                        }
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt)))
+                        .await;
+                }
+
+                Err(CfmpegError::Upload {
+                    filename: file_path.display().to_string(),
+                    reason: format!("chunk {} failed after retries", target.index),
+                })
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    for result in results {
+        result?;
+    }
+
+    progress.finish_with_message(filename);
+
+    Ok(())
 }
 
 fn should_use_multipart(target: &UploadTarget) -> bool {
