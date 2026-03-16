@@ -8,6 +8,7 @@ use std::time::Duration;
 
 const JOB_TIMEOUT_SECS: u64 = 3600;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_TRANSIENT_POLL_ERRORS: u8 = 30;
 
 enum StreamProgressOutcome {
     Completed,
@@ -60,6 +61,14 @@ pub async fn wait_for_completion(
     }
 }
 
+fn should_retry_poll_error(error: &CfmpegError) -> bool {
+    match error {
+        CfmpegError::Http(_) | CfmpegError::ApiUnreachable(_) => true,
+        CfmpegError::Api { status, .. } => *status == 429 || *status >= 500,
+        _ => false,
+    }
+}
+
 async fn stream_progress(
     api: &ApiClient,
     http_client: &Client,
@@ -106,13 +115,33 @@ async fn stream_progress(
 
 async fn poll_progress(api: &ApiClient, job_id: &str, progress: &ProgressBar) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(JOB_TIMEOUT_SECS);
+    let mut transient_errors = 0u8;
 
     loop {
         if tokio::time::Instant::now() > deadline {
             return Err(CfmpegError::JobTimeout(JOB_TIMEOUT_SECS));
         }
 
-        let status = api.get_job_status(job_id).await?;
+        let status = match api.get_job_status(job_id).await {
+            Ok(status) => {
+                transient_errors = 0;
+                status
+            }
+            Err(error) if should_retry_poll_error(&error) => {
+                transient_errors = transient_errors.saturating_add(1);
+
+                if transient_errors >= MAX_TRANSIENT_POLL_ERRORS {
+                    return Err(error);
+                }
+
+                progress.set_message(format!(
+                    "retrying status ({transient_errors}/{MAX_TRANSIENT_POLL_ERRORS})"
+                ));
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let _ = &status.job_id;
 
         match status.status {
@@ -173,8 +202,9 @@ fn update_progress_bar(progress: &ProgressBar, job_progress: &JobProgress) {
 
 #[cfg(test)]
 mod tests {
-    use super::{terminal_outcome, StreamProgressOutcome};
+    use super::{should_retry_poll_error, terminal_outcome, StreamProgressOutcome};
     use crate::api::ProgressEvent;
+    use crate::error::CfmpegError;
     use serde_json::json;
 
     #[test]
@@ -204,5 +234,27 @@ mod tests {
         };
 
         assert_eq!(message, "remote job was cancelled");
+    }
+
+    #[test]
+    fn retries_transient_poll_errors() {
+        let error = CfmpegError::Api {
+            status: 503,
+            code: None,
+            message: "upstream unavailable".to_string(),
+        };
+
+        assert!(should_retry_poll_error(&error));
+    }
+
+    #[test]
+    fn does_not_retry_terminal_poll_errors() {
+        let error = CfmpegError::Api {
+            status: 404,
+            code: None,
+            message: "missing".to_string(),
+        };
+
+        assert!(!should_retry_poll_error(&error));
     }
 }
