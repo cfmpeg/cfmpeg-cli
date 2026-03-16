@@ -1,10 +1,9 @@
-use crate::api::UploadTarget;
+use crate::api::{CompletedMultipartPart, UploadTarget};
 use crate::error::{CfmpegError, Result};
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::header::{HeaderMap, ETAG};
 use reqwest::Client;
-use sha2::{Digest, Sha256};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -12,13 +11,16 @@ use tokio::sync::Mutex;
 
 const MAX_CONCURRENT_UPLOADS: usize = 6;
 const MAX_RETRIES: u32 = 3;
-const DIRECT_UPLOAD_THRESHOLD: u64 = 25 * 1024 * 1024;
+
+pub struct UploadResult {
+    pub multipart_parts: Vec<CompletedMultipartPart>,
+}
 
 pub async fn upload_file(
     client: &Client,
     file_path: &Path,
     target: &UploadTarget,
-) -> Result<String> {
+) -> Result<UploadResult> {
     let file_size = std::fs::metadata(file_path)?.len();
     let filename = file_path
         .file_name()
@@ -38,16 +40,16 @@ pub async fn upload_file(
         target.filename.clone()
     });
 
-    let upload_result = if should_use_multipart(file_size, target) {
+    let upload_result = if should_use_multipart(target) {
         multipart_upload(client, file_path, target, &progress).await
     } else {
         direct_upload(client, file_path, target, &progress).await
     };
 
     match upload_result {
-        Ok(()) => {
+        Ok(result) => {
             progress.finish_with_message(filename.clone());
-            hash_file(file_path).await
+            Ok(result)
         }
         Err(error) => {
             progress.abandon_with_message(filename);
@@ -56,10 +58,8 @@ pub async fn upload_file(
     }
 }
 
-fn should_use_multipart(file_size: u64, target: &UploadTarget) -> bool {
-    target.method.eq_ignore_ascii_case("multipart")
-        && !target.part_urls.is_empty()
-        && file_size > DIRECT_UPLOAD_THRESHOLD
+fn should_use_multipart(target: &UploadTarget) -> bool {
+    target.method.eq_ignore_ascii_case("multipart") && !target.part_urls.is_empty()
 }
 
 async fn direct_upload(
@@ -67,7 +67,7 @@ async fn direct_upload(
     file_path: &Path,
     target: &UploadTarget,
     progress: &ProgressBar,
-) -> Result<()> {
+) -> Result<UploadResult> {
     let data = tokio::fs::read(file_path).await?;
 
     let mut request = client.put(&target.upload_url);
@@ -107,7 +107,9 @@ async fn direct_upload(
 
     progress.set_position(data.len() as u64);
 
-    Ok(())
+    Ok(UploadResult {
+        multipart_parts: Vec::new(),
+    })
 }
 
 async fn multipart_upload(
@@ -115,7 +117,7 @@ async fn multipart_upload(
     file_path: &Path,
     target: &UploadTarget,
     progress: &ProgressBar,
-) -> Result<()> {
+) -> Result<UploadResult> {
     let part_size = target.part_size as usize;
     let uploaded_bytes = Arc::new(Mutex::new(0u64));
     let chunks: Vec<(usize, String)> = target
@@ -125,7 +127,7 @@ async fn multipart_upload(
         .map(|(index, url)| (index, url.clone()))
         .collect();
 
-    let results: Vec<Result<()>> = stream::iter(chunks)
+    let results: Vec<Result<CompletedMultipartPart>> = stream::iter(chunks)
         .map(|(part_index, part_url)| {
             let client = client.clone();
             let file_path = file_path.to_path_buf();
@@ -146,10 +148,23 @@ async fn multipart_upload(
 
                     match response {
                         Ok(response) if response.status().is_success() => {
+                            let etag =
+                                extract_multipart_etag(response.headers()).ok_or_else(|| {
+                                    CfmpegError::Upload {
+                                        filename: file_path.display().to_string(),
+                                        reason: format!(
+                                            "part {} succeeded without an ETag header",
+                                            part_index + 1
+                                        ),
+                                    }
+                                })?;
                             let mut uploaded = uploaded_bytes.lock().await;
                             *uploaded += chunk_size;
                             progress.set_position(*uploaded);
-                            return Ok(());
+                            return Ok(CompletedMultipartPart {
+                                part_number: (part_index + 1) as u32,
+                                etag,
+                            });
                         }
                         Ok(response) => {
                             if attempt == MAX_RETRIES - 1 {
@@ -187,11 +202,17 @@ async fn multipart_upload(
         .collect()
         .await;
 
+    let mut completed_parts = Vec::with_capacity(results.len());
+
     for result in results {
-        result?;
+        completed_parts.push(result?);
     }
 
-    Ok(())
+    completed_parts.sort();
+
+    Ok(UploadResult {
+        multipart_parts: completed_parts,
+    })
 }
 
 async fn read_chunk(file_path: &PathBuf, part_index: usize, part_size: usize) -> Result<Vec<u8>> {
@@ -207,30 +228,33 @@ async fn read_chunk(file_path: &PathBuf, part_index: usize, part_size: usize) ->
     Ok(chunk)
 }
 
-pub async fn hash_file(path: &Path) -> Result<String> {
-    let path = path.to_path_buf();
-    let display_path = path.display().to_string();
+fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
 
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open(&path)?;
-        let mut reader = std::io::BufReader::new(file);
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 8192];
+#[cfg(test)]
+mod tests {
+    use super::extract_multipart_etag;
+    use reqwest::header::{HeaderMap, HeaderValue, ETAG};
 
-        loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-        }
+    #[test]
+    fn extracts_multipart_etag_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ETAG, HeaderValue::from_static("\"etag-123\""));
 
-        Ok::<String, std::io::Error>(format!("{:x}", hasher.finalize()))
-    })
-    .await
-    .map_err(|error| CfmpegError::Upload {
-        filename: display_path,
-        reason: format!("hashing failed: {error}"),
-    })?
-    .map_err(CfmpegError::Io)
+        assert_eq!(
+            extract_multipart_etag(&headers).as_deref(),
+            Some("\"etag-123\"")
+        );
+    }
+
+    #[test]
+    fn returns_none_when_multipart_etag_is_missing() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(extract_multipart_etag(&headers), None);
+    }
 }

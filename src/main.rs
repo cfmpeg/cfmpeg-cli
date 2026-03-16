@@ -10,7 +10,9 @@ mod parser;
 mod remote;
 mod upload;
 
-use crate::api::{ApiClient, CreateJobRequest, JobInput};
+use crate::api::{
+    ApiClient, CompletedMultipartUpload, CreateJobRequest, JobInput, StartJobRequest,
+};
 use crate::cli::{AuthAction, Command, ConfigAction};
 use crate::config::Config;
 use crate::error::{CfmpegError, Result};
@@ -234,13 +236,36 @@ async fn run_encode(
 
     if !local_inputs.is_empty() {
         eprintln!();
+        let mut multipart_uploads = Vec::new();
+
         for (index, path) in local_inputs.iter().enumerate() {
-            upload::upload_file(&http_client, path, &job.uploads[index]).await?;
+            let upload_result =
+                upload::upload_file(&http_client, path, &job.uploads[index]).await?;
+
+            if !upload_result.multipart_parts.is_empty() {
+                multipart_uploads.push(CompletedMultipartUpload {
+                    file_id: job.uploads[index].file_id,
+                    parts: upload_result.multipart_parts,
+                });
+            }
         }
         eprintln!();
-    }
 
-    if let Err(error) = api.start_job(&job.job_id).await {
+        let start_request = StartJobRequest { multipart_uploads };
+
+        if let Err(error) = api.start_job(&job.job_id, &start_request).await {
+            if let Some(result) =
+                maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
+            {
+                return result;
+            }
+
+            return Err(error);
+        }
+    } else if let Err(error) = api
+        .start_job(&job.job_id, &StartJobRequest::default())
+        .await
+    {
         if let Some(result) =
             maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
         {

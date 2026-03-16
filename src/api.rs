@@ -42,6 +42,7 @@ pub struct CreateJobResponse {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct UploadTarget {
+    pub file_id: u64,
     pub filename: String,
     pub upload_url: String,
     pub method: String,
@@ -49,6 +50,24 @@ pub struct UploadTarget {
     pub part_urls: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_headers")]
     pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct StartJobRequest {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub multipart_uploads: Vec<CompletedMultipartUpload>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct CompletedMultipartUpload {
+    pub file_id: u64,
+    pub parts: Vec<CompletedMultipartPart>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompletedMultipartPart {
+    pub part_number: u32,
+    pub etag: String,
 }
 
 fn deserialize_headers<'de, D>(
@@ -118,7 +137,10 @@ pub enum JobState {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_error_response, ApiClient, JobState, JobStatus, UploadTarget};
+    use super::{
+        parse_error_response, ApiClient, CompletedMultipartPart, JobState, JobStatus,
+        StartJobRequest, UploadTarget,
+    };
 
     #[test]
     fn deserializes_queued_job_status() {
@@ -137,6 +159,7 @@ mod tests {
     fn deserializes_upload_headers() {
         let target: UploadTarget = serde_json::from_str(
             r#"{
+                "file_id": 42,
                 "filename": "input.mov",
                 "upload_url": "https://example.com/upload",
                 "method": "direct",
@@ -149,6 +172,7 @@ mod tests {
         )
         .expect("upload target should deserialize");
 
+        assert_eq!(target.file_id, 42);
         assert_eq!(
             target.headers.get("x-test-header").map(String::as_str),
             Some("signed-value")
@@ -159,6 +183,7 @@ mod tests {
     fn deserializes_empty_upload_headers_array() {
         let target: UploadTarget = serde_json::from_str(
             r#"{
+                "file_id": 7,
                 "filename": "input.mov",
                 "upload_url": "https://example.com/upload",
                 "method": "direct",
@@ -169,7 +194,49 @@ mod tests {
         )
         .expect("empty header array should deserialize");
 
+        assert_eq!(target.file_id, 7);
         assert!(target.headers.is_empty());
+    }
+
+    #[test]
+    fn omits_empty_multipart_uploads_from_start_request() {
+        let payload = serde_json::to_value(StartJobRequest::default())
+            .expect("start request should serialize");
+
+        assert_eq!(payload, serde_json::json!({}));
+    }
+
+    #[test]
+    fn serializes_completed_multipart_uploads() {
+        let payload = serde_json::to_value(StartJobRequest {
+            multipart_uploads: vec![super::CompletedMultipartUpload {
+                file_id: 9,
+                parts: vec![
+                    CompletedMultipartPart {
+                        part_number: 2,
+                        etag: "\"etag-2\"".to_string(),
+                    },
+                    CompletedMultipartPart {
+                        part_number: 1,
+                        etag: "\"etag-1\"".to_string(),
+                    },
+                ],
+            }],
+        })
+        .expect("start request should serialize");
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "multipart_uploads": [{
+                    "file_id": 9,
+                    "parts": [
+                        {"part_number": 2, "etag": "\"etag-2\""},
+                        {"part_number": 1, "etag": "\"etag-1\""}
+                    ]
+                }]
+            })
+        );
     }
 
     #[test]
@@ -365,11 +432,12 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
-    pub async fn start_job(&self, job_id: &str) -> Result<JobStatus> {
+    pub async fn start_job(&self, job_id: &str, request: &StartJobRequest) -> Result<JobStatus> {
         let response = self
             .client
             .post(format!("{}/jobs/{job_id}/start", self.base_url))
             .bearer_auth(&self.api_key)
+            .json(request)
             .send()
             .await?;
 
