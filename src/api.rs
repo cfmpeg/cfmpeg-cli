@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: Client,
     base_url: String,
@@ -37,7 +38,42 @@ pub struct JobInput {
 #[derive(Debug, Deserialize)]
 pub struct CreateJobResponse {
     pub job_id: String,
+    #[serde(default)]
     pub uploads: Vec<UploadTarget>,
+    #[serde(default)]
+    pub ingest: JobIngest,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JobIngest {
+    #[serde(default = "default_ingest_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub stream_url: Option<String>,
+    #[serde(default)]
+    pub claim_url: Option<String>,
+    #[serde(default)]
+    pub input_format: Option<String>,
+    #[serde(default)]
+    pub stream_strategy: Option<String>,
+}
+
+impl JobIngest {
+    pub fn is_direct_stream(&self) -> bool {
+        self.mode == "direct_stream"
+    }
+}
+
+impl Default for JobIngest {
+    fn default() -> Self {
+        Self {
+            mode: default_ingest_mode(),
+            stream_url: None,
+            claim_url: None,
+            input_format: None,
+            stream_strategy: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -113,6 +149,10 @@ where
     deserializer.deserialize_any(HeadersVisitor)
 }
 
+fn default_ingest_mode() -> String {
+    "durable".to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct JobStatus {
     pub job_id: String,
@@ -138,8 +178,8 @@ pub enum JobState {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_error_response, ApiClient, CompletedMultipartPart, JobState, JobStatus,
-        ProgressEvent, StartJobRequest, UploadTarget,
+        parse_error_response, ApiClient, CompletedMultipartPart, CreateJobResponse, JobState,
+        JobStatus, ProgressEvent, StartJobRequest, UploadTarget,
     };
 
     #[test]
@@ -262,6 +302,45 @@ mod tests {
     }
 
     #[test]
+    fn defaults_ingest_mode_to_durable() {
+        let response: CreateJobResponse = serde_json::from_str(
+            r#"{
+                "job_id": "job_123",
+                "uploads": []
+            }"#,
+        )
+        .expect("create job response should deserialize");
+
+        assert_eq!(response.ingest.mode, "durable");
+        assert!(!response.ingest.is_direct_stream());
+    }
+
+    #[test]
+    fn deserializes_direct_stream_ingest_targets() {
+        let response: CreateJobResponse = serde_json::from_str(
+            r#"{
+                "job_id": "job_123",
+                "uploads": [],
+                "ingest": {
+                    "mode": "direct_stream",
+                    "stream_url": "https://worker.example.test/stream-gpu",
+                    "claim_url": "https://app.example.test/v1/callbacks/jobs/job_123/stream-claim",
+                    "input_format": "mpegts",
+                    "stream_strategy": "copy_remux"
+                }
+            }"#,
+        )
+        .expect("direct stream response should deserialize");
+
+        assert!(response.ingest.is_direct_stream());
+        assert_eq!(
+            response.ingest.stream_url.as_deref(),
+            Some("https://worker.example.test/stream-gpu")
+        );
+        assert_eq!(response.ingest.input_format.as_deref(), Some("mpegts"));
+    }
+
+    #[test]
     fn prefers_json_api_errors() {
         let (message, code) = parse_error_response(
             422,
@@ -368,7 +447,7 @@ struct ApiErrorResponse {
     pub code: Option<String>,
 }
 
-fn parse_error_response(
+pub(crate) fn parse_error_response(
     status_code: u16,
     content_type: Option<&str>,
     body: &str,
@@ -402,7 +481,7 @@ fn parse_error_response(
     (truncate_error_message(single_line, 240), None)
 }
 
-fn truncate_error_message(message: &str, max_len: usize) -> String {
+pub(crate) fn truncate_error_message(message: &str, max_len: usize) -> String {
     if message.chars().count() <= max_len {
         return message.to_string();
     }

@@ -12,6 +12,7 @@ pub enum Command {
     Encode {
         ffmpeg_args: Vec<String>,
         force_local: bool,
+        no_download: bool,
         remote: RemoteExecutionOptions,
     },
     Help,
@@ -52,7 +53,7 @@ pub fn print_help() {
     println!("cfmpeg");
     println!();
     println!("Usage:");
-    println!("  cfmpeg [--local] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-gpu <mode>] [--cf-timeout <duration>] <ffmpeg args...>");
+    println!("  cfmpeg [--local] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-gpu <mode>] [--cf-timeout <duration>] <ffmpeg args...>");
     println!("  cfmpeg auth <login|status|logout>");
     println!("  cfmpeg config [path|show|edit]");
     println!("  cfmpeg usage");
@@ -63,6 +64,7 @@ pub fn print_help() {
     println!("Notes:");
     println!("  - Arguments that look like ffmpeg flags are passed through directly.");
     println!("  - Use `--local` to force local ffmpeg execution.");
+    println!("  - Use `--no-download` to leave completed outputs in cloud storage and print signed URLs instead.");
     println!("  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.");
     println!("  - Use `cfmpeg help` for CLI help because `-h` is treated as an ffmpeg flag.");
 }
@@ -113,6 +115,7 @@ fn parse_exact(raw_args: Vec<String>, command: Command) -> Result<Command> {
 
 fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     let mut force_local = false;
+    let mut no_download = false;
     let mut show_codecs = false;
     let mut show_version = false;
     let mut ffmpeg_args = Vec::new();
@@ -123,6 +126,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         let arg = &raw_args[index];
         match arg.as_str() {
             "--local" => force_local = true,
+            "--no-download" => no_download = true,
             "--codecs" => show_codecs = true,
             "--version" => show_version = true,
             _ if arg.starts_with("--cf-profile=") => {
@@ -191,7 +195,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     }
 
     if show_codecs {
-        if force_local || show_version || !ffmpeg_args.is_empty() {
+        if force_local || no_download || show_version || !ffmpeg_args.is_empty() {
             return Err(CfmpegError::ParseError(
                 "--codecs must be used on its own".to_string(),
             ));
@@ -201,7 +205,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     }
 
     if show_version {
-        if force_local || !ffmpeg_args.is_empty() {
+        if force_local || no_download || !ffmpeg_args.is_empty() {
             return Err(CfmpegError::ParseError(
                 "--version must be used on its own".to_string(),
             ));
@@ -223,6 +227,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     Ok(Command::Encode {
         ffmpeg_args,
         force_local,
+        no_download,
         remote,
     })
 }
@@ -258,6 +263,7 @@ mod tests {
             Command::Encode {
                 ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
                 force_local: true,
+                no_download: false,
                 remote: RemoteExecutionOptions::default(),
             }
         );
@@ -285,6 +291,7 @@ mod tests {
             Command::Encode {
                 ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
                 force_local: false,
+                no_download: false,
                 remote: RemoteExecutionOptions {
                     profile: Some(PROFILE_GPU.to_string()),
                     cpu: Some(8),
@@ -330,5 +337,21 @@ mod tests {
         .expect_err("error");
 
         assert!(error.to_string().contains("--cf-*"));
+    }
+
+    #[test]
+    fn parses_no_download_flag_separately_from_ffmpeg_args() {
+        let command =
+            parse_args(args(&["--no-download", "-i", "input.mov", "output.mp4"])).expect("command");
+
+        assert_eq!(
+            command,
+            Command::Encode {
+                ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
+                force_local: false,
+                no_download: true,
+                remote: RemoteExecutionOptions::default(),
+            }
+        );
     }
 }

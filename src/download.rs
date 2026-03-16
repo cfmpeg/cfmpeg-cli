@@ -46,6 +46,12 @@ pub async fn download_outputs(
     Ok(())
 }
 
+pub fn print_output_urls(remote_outputs: &[OutputFile]) {
+    for line in format_output_urls(remote_outputs) {
+        println!("{line}");
+    }
+}
+
 async fn download_file(
     client: &Client,
     remote_output: &OutputFile,
@@ -114,4 +120,41 @@ async fn download_file(
     );
 
     Ok(())
+}
+
+fn format_output_urls(remote_outputs: &[OutputFile]) -> Vec<String> {
+    remote_outputs
+        .iter()
+        .map(|output| format!("{}\t{}", output.filename, output.download_url))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_output_urls;
+    use crate::api::OutputFile;
+
+    #[test]
+    fn formats_output_urls_for_no_download_mode() {
+        let lines = format_output_urls(&[
+            OutputFile {
+                filename: "output-0.mp4".to_string(),
+                download_url: "https://example.com/output-0.mp4".to_string(),
+                size_bytes: 123,
+            },
+            OutputFile {
+                filename: "output-1.mp4".to_string(),
+                download_url: "https://example.com/output-1.mp4".to_string(),
+                size_bytes: 456,
+            },
+        ]);
+
+        assert_eq!(
+            lines,
+            vec![
+                "output-0.mp4\thttps://example.com/output-0.mp4".to_string(),
+                "output-1.mp4\thttps://example.com/output-1.mp4".to_string(),
+            ]
+        );
+    }
 }

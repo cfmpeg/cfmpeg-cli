@@ -9,7 +9,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 
-const MAX_CONCURRENT_UPLOADS: usize = 6;
+const MIN_CONCURRENT_UPLOADS: usize = 6;
+const MAX_CONCURRENT_UPLOADS: usize = 24;
 const MAX_RETRIES: u32 = 3;
 
 pub struct UploadResult {
@@ -127,6 +128,7 @@ async fn multipart_upload(
         .enumerate()
         .map(|(index, url)| (index, url.clone()))
         .collect();
+    let concurrency = multipart_upload_concurrency(chunks.len(), file_size);
 
     let results: Vec<Result<CompletedMultipartPart>> = stream::iter(chunks)
         .map(|(part_index, part_url)| {
@@ -199,7 +201,7 @@ async fn multipart_upload(
                 })
             }
         })
-        .buffer_unordered(MAX_CONCURRENT_UPLOADS)
+        .buffer_unordered(concurrency)
         .collect()
         .await;
 
@@ -247,6 +249,24 @@ fn chunk_size_for_part(file_size: u64, part_index: usize, part_size: usize) -> R
     Ok(((file_size - start) as usize).min(part_size))
 }
 
+fn multipart_upload_concurrency(part_count: usize, file_size: u64) -> usize {
+    if part_count == 0 {
+        return 1;
+    }
+
+    let target = if file_size >= 5 * 1024 * 1024 * 1024 {
+        MAX_CONCURRENT_UPLOADS
+    } else if file_size >= 1024 * 1024 * 1024 {
+        16
+    } else if file_size >= 256 * 1024 * 1024 {
+        8
+    } else {
+        MIN_CONCURRENT_UPLOADS
+    };
+
+    target.clamp(1, MAX_CONCURRENT_UPLOADS).min(part_count)
+}
+
 fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
     headers
         .get(ETAG)
@@ -256,7 +276,7 @@ fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_size_for_part, extract_multipart_etag};
+    use super::{chunk_size_for_part, extract_multipart_etag, multipart_upload_concurrency};
     use reqwest::header::{HeaderMap, HeaderValue, ETAG};
 
     #[test]
@@ -291,5 +311,14 @@ mod tests {
             chunk_size_for_part(25 * 1024 * 1024, 2, 10 * 1024 * 1024).unwrap(),
             5 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn scales_upload_concurrency_with_file_size() {
+        assert_eq!(multipart_upload_concurrency(2, 512 * 1024 * 1024), 2);
+        assert_eq!(multipart_upload_concurrency(6, 128 * 1024 * 1024), 6);
+        assert_eq!(multipart_upload_concurrency(12, 512 * 1024 * 1024), 8);
+        assert_eq!(multipart_upload_concurrency(20, 2 * 1024 * 1024 * 1024), 16);
+        assert_eq!(multipart_upload_concurrency(40, 8 * 1024 * 1024 * 1024), 24);
     }
 }

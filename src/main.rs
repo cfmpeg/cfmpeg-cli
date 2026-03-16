@@ -8,6 +8,7 @@ mod fallback;
 mod job;
 mod parser;
 mod remote;
+mod stream;
 mod upload;
 
 use crate::api::{
@@ -51,8 +52,9 @@ async fn run() -> Result<()> {
         Command::Encode {
             ffmpeg_args,
             force_local,
+            no_download,
             remote,
-        } => run_encode(&ffmpeg_args, force_local, remote).await,
+        } => run_encode(&ffmpeg_args, force_local, no_download, remote).await,
         Command::Help => {
             cli::print_help();
             Ok(())
@@ -113,6 +115,7 @@ fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
 async fn run_encode(
     ffmpeg_args: &[String],
     force_local: bool,
+    no_download: bool,
     remote: remote::RemoteExecutionOptions,
 ) -> Result<()> {
     let config = Config::load()?;
@@ -228,40 +231,83 @@ async fn run_encode(
         })
         .collect();
 
-    if job.uploads.len() < local_inputs.len() {
+    if !job.ingest.is_direct_stream() && job.uploads.len() < local_inputs.len() {
         return Err(CfmpegError::Protocol(
             "api returned fewer upload targets than local inputs".to_string(),
         ));
     }
 
-    if !local_inputs.is_empty() {
-        if let Err(error) = api.prepare_job(&job.job_id).await {
-            eprintln!(
-                "  warning: remote worker warmup failed; continuing with the normal start path."
-            );
-            eprintln!("  note: {error}");
-            eprintln!();
+    if job.ingest.is_direct_stream() {
+        let [input_path] = local_inputs.as_slice() else {
+            return Err(CfmpegError::Protocol(
+                "direct stream jobs require exactly one local input".to_string(),
+            ));
+        };
+
+        eprintln!(
+            "  {} direct streaming enabled for this job",
+            style("->").cyan()
+        );
+        eprintln!();
+
+        let monitor_api = api.clone();
+        let monitor_http_client = http_client.clone();
+        let monitor_job_id = job.job_id.clone();
+        let monitor = tokio::spawn(async move {
+            job::wait_for_completion(&monitor_api, &monitor_http_client, &monitor_job_id).await
+        });
+
+        if let Err(error) = stream::stream_input(&http_client, &job.ingest, input_path).await {
+            monitor.abort();
+            let _ = monitor.await;
+
+            return Err(error);
         }
 
-        eprintln!();
-        let mut multipart_uploads = Vec::new();
-
-        for (index, path) in local_inputs.iter().enumerate() {
-            let upload_result =
-                upload::upload_file(&http_client, path, &job.uploads[index]).await?;
-
-            if !upload_result.multipart_parts.is_empty() {
-                multipart_uploads.push(CompletedMultipartUpload {
-                    file_id: job.uploads[index].file_id,
-                    parts: upload_result.multipart_parts,
-                });
+        monitor.await.map_err(|error| {
+            CfmpegError::JobFailed(format!("job monitor task failed: {error}"))
+        })??;
+    } else {
+        if !local_inputs.is_empty() {
+            if let Err(error) = api.prepare_job(&job.job_id).await {
+                eprintln!(
+                    "  warning: remote worker warmup failed; continuing with the normal start path."
+                );
+                eprintln!("  note: {error}");
+                eprintln!();
             }
-        }
-        eprintln!();
 
-        let start_request = StartJobRequest { multipart_uploads };
+            eprintln!();
+            let mut multipart_uploads = Vec::new();
 
-        if let Err(error) = api.start_job(&job.job_id, &start_request).await {
+            for (index, path) in local_inputs.iter().enumerate() {
+                let upload_result =
+                    upload::upload_file(&http_client, path, &job.uploads[index]).await?;
+
+                if !upload_result.multipart_parts.is_empty() {
+                    multipart_uploads.push(CompletedMultipartUpload {
+                        file_id: job.uploads[index].file_id,
+                        parts: upload_result.multipart_parts,
+                    });
+                }
+            }
+            eprintln!();
+
+            let start_request = StartJobRequest { multipart_uploads };
+
+            if let Err(error) = api.start_job(&job.job_id, &start_request).await {
+                if let Some(result) =
+                    maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
+                {
+                    return result;
+                }
+
+                return Err(error);
+            }
+        } else if let Err(error) = api
+            .start_job(&job.job_id, &StartJobRequest::default())
+            .await
+        {
             if let Some(result) =
                 maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
             {
@@ -270,27 +316,27 @@ async fn run_encode(
 
             return Err(error);
         }
-    } else if let Err(error) = api
-        .start_job(&job.job_id, &StartJobRequest::default())
-        .await
-    {
-        if let Some(result) =
-            maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
-        {
-            return result;
-        }
 
-        return Err(error);
+        job::wait_for_completion(&api, &http_client, &job.job_id).await?;
     }
-
-    job::wait_for_completion(&api, &http_client, &job.job_id).await?;
 
     let outputs = api.get_outputs(&job.job_id).await?;
 
-    eprintln!();
-    download::download_outputs(&http_client, &outputs.outputs, &parsed.outputs).await?;
-    eprintln!();
-    eprintln!("  {} complete.", style("ok").green().bold());
+    if no_download {
+        eprintln!();
+        eprintln!(
+            "  {} remote outputs are ready. Skipping local download.",
+            style("ok").green().bold()
+        );
+        download::print_output_urls(&outputs.outputs);
+        eprintln!();
+        eprintln!("  {} complete.", style("ok").green().bold());
+    } else {
+        eprintln!();
+        download::download_outputs(&http_client, &outputs.outputs, &parsed.outputs).await?;
+        eprintln!();
+        eprintln!("  {} complete.", style("ok").green().bold());
+    }
 
     Ok(())
 }
