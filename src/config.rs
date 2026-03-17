@@ -1,7 +1,6 @@
 use crate::error::{CfmpegError, Result};
 use crate::remote::{
-    parse_cpu_cores, parse_gpu_mode, parse_memory_mb, parse_profile, parse_timeout_seconds,
-    RemoteExecutionOptions,
+    parse_cpu_cores, parse_memory_mb, parse_profile, parse_timeout_seconds, RemoteExecutionOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -18,7 +17,6 @@ pub struct Config {
     pub remote_profile: Option<String>,
     pub remote_cpu: Option<u16>,
     pub remote_memory_mb: Option<u32>,
-    pub remote_gpu: Option<String>,
     pub remote_timeout_seconds: Option<u32>,
 }
 
@@ -31,7 +29,6 @@ impl Default for Config {
             remote_profile: None,
             remote_cpu: None,
             remote_memory_mb: None,
-            remote_gpu: None,
             remote_timeout_seconds: None,
         }
     }
@@ -119,9 +116,16 @@ impl Config {
     pub fn remote_execution_defaults(&self) -> Result<RemoteExecutionOptions> {
         Ok(RemoteExecutionOptions {
             profile: option_from_env("CFMPEG_REMOTE_PROFILE")
-                .map(|value| parse_profile(&value))
+                .map(|value| normalize_profile(&value))
                 .transpose()?
-                .or_else(|| self.remote_profile.clone()),
+                .or_else(|| {
+                    self.remote_profile
+                        .as_deref()
+                        .map(normalize_profile)
+                        .transpose()
+                        .ok()
+                        .flatten()
+                }),
             cpu: option_from_env("CFMPEG_REMOTE_CPU")
                 .map(|value| parse_cpu_cores(&value))
                 .transpose()?
@@ -130,10 +134,6 @@ impl Config {
                 .map(|value| parse_memory_mb(&value))
                 .transpose()?
                 .or(self.remote_memory_mb),
-            gpu: option_from_env("CFMPEG_REMOTE_GPU")
-                .map(|value| parse_gpu_mode(&value))
-                .transpose()?
-                .or_else(|| self.remote_gpu.clone()),
             timeout_seconds: option_from_env("CFMPEG_REMOTE_TIMEOUT")
                 .map(|value| parse_timeout_seconds(&value))
                 .transpose()?
@@ -184,6 +184,14 @@ fn option_from_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_profile(value: &str) -> Result<String> {
+    if value.trim() == "gpu" {
+        return Ok("highcpu".to_string());
+    }
+
+    parse_profile(value)
 }
 
 #[cfg(test)]
@@ -261,7 +269,6 @@ mod tests {
             remote_profile: Some("balanced".to_string()),
             remote_cpu: Some(4),
             remote_memory_mb: Some(8192),
-            remote_gpu: Some("prefer".to_string()),
             remote_timeout_seconds: Some(1800),
             ..Config::default()
         };
@@ -273,7 +280,20 @@ mod tests {
         assert_eq!(remote.profile.as_deref(), Some("balanced"));
         assert_eq!(remote.cpu, Some(4));
         assert_eq!(remote.memory_mb, Some(8192));
-        assert_eq!(remote.gpu.as_deref(), Some("prefer"));
         assert_eq!(remote.timeout_seconds, Some(1800));
+    }
+
+    #[test]
+    fn remote_execution_defaults_downgrade_legacy_gpu_profile() {
+        let config = Config {
+            remote_profile: Some("gpu".to_string()),
+            ..Config::default()
+        };
+
+        let remote = config
+            .remote_execution_defaults()
+            .expect("remote execution defaults");
+
+        assert_eq!(remote.profile.as_deref(), Some("highcpu"));
     }
 }

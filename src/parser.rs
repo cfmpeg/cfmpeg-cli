@@ -21,8 +21,6 @@ pub struct ParsedCommand {
     pub sandbox_args: Vec<String>,
 }
 
-const GPU_VIDEO_ENCODERS: &[&str] = &["h264_nvenc", "hevc_nvenc", "av1_nvenc"];
-
 const VALUED_OPTIONS: &[&str] = &[
     "-ac",
     "-ar",
@@ -202,22 +200,6 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
     })
 }
 
-pub fn describe_gpu_compatibility_warning(args: &[String]) -> Option<String> {
-    let encoder = explicit_video_codec(args)?;
-
-    if encoder == "copy" {
-        return Some("video stream copy (`copy`) will not use GPU encoding".to_string());
-    }
-
-    if is_gpu_video_encoder(&encoder) {
-        return None;
-    }
-
-    Some(format!(
-        "video encoder `{encoder}` will not use cfmpeg's NVENC GPU path"
-    ))
-}
-
 #[cfg(test)]
 pub fn parse_concat_filelist(filelist_path: &Path) -> Result<Vec<PathBuf>> {
     let contents = std::fs::read_to_string(filelist_path).map_err(|error| {
@@ -319,67 +301,6 @@ fn build_remote_output_name(output_path: &Path, output_counter: usize) -> String
     format!("output_{output_counter}{extension}")
 }
 
-fn explicit_video_codec(args: &[String]) -> Option<String> {
-    let mut selected = None;
-    let mut index = 0usize;
-
-    while index < args.len() {
-        let arg = &args[index];
-
-        if let Some(value) = option_value_from_equals(arg, &["-vcodec"]) {
-            selected = Some(value.to_string());
-            index += 1;
-            continue;
-        }
-
-        if let Some(value) = stream_specific_video_codec_value_from_equals(arg) {
-            selected = Some(value.to_string());
-            index += 1;
-            continue;
-        }
-
-        if arg == "-vcodec" {
-            selected = args.get(index + 1).cloned();
-            index += 2;
-            continue;
-        }
-
-        if let Some(value) = option_value_from_equals(arg, &["-c:v", "-codec:v"]) {
-            selected = Some(value.to_string());
-            index += 1;
-            continue;
-        }
-
-        if is_video_codec_option(arg) {
-            selected = args.get(index + 1).cloned();
-            index += 2;
-            continue;
-        }
-
-        if let Some(value) = option_value_from_equals(arg, &["-c", "-codec"]) {
-            if is_video_codec_candidate(value) {
-                selected = Some(value.to_string());
-            }
-            index += 1;
-            continue;
-        }
-
-        if arg == "-c" || arg == "-codec" {
-            if let Some(value) = args.get(index + 1) {
-                if is_video_codec_candidate(value) {
-                    selected = Some(value.clone());
-                }
-            }
-            index += 2;
-            continue;
-        }
-
-        index += 1;
-    }
-
-    selected
-}
-
 fn is_valued_option(arg: &str) -> bool {
     VALUED_OPTIONS.contains(&arg)
 }
@@ -388,52 +309,9 @@ fn is_flag_option(arg: &str) -> bool {
     FLAG_OPTIONS.contains(&arg)
 }
 
-fn option_value_from_equals<'a>(arg: &'a str, prefixes: &[&str]) -> Option<&'a str> {
-    prefixes.iter().find_map(|prefix| {
-        arg.strip_prefix(prefix)
-            .and_then(|value| value.strip_prefix('='))
-            .filter(|value| !value.is_empty())
-    })
-}
-
-fn stream_specific_video_codec_value_from_equals(arg: &str) -> Option<&str> {
-    if !(arg.starts_with("-c:v:") || arg.starts_with("-codec:v:")) {
-        return None;
-    }
-
-    arg.split_once('=')
-        .map(|(_, value)| value)
-        .filter(|value| !value.is_empty())
-}
-
-fn is_video_codec_option(arg: &str) -> bool {
-    matches!(arg, "-c:v" | "-codec:v") || arg.starts_with("-c:v:") || arg.starts_with("-codec:v:")
-}
-
-fn is_gpu_video_encoder(value: &str) -> bool {
-    GPU_VIDEO_ENCODERS.contains(&value)
-}
-
-fn is_video_codec_candidate(value: &str) -> bool {
-    value == "copy"
-        || value.contains("264")
-        || value.contains("265")
-        || value.contains("hevc")
-        || value.contains("av1")
-        || value.contains("vp8")
-        || value.contains("vp9")
-        || value.contains("mpeg")
-        || value.contains("prores")
-        || value.contains("dnx")
-        || value.contains("theora")
-        || value.contains("ffv1")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        describe_gpu_compatibility_warning, parse_concat_filelist, parse_ffmpeg_args, Input,
-    };
+    use super::{parse_concat_filelist, parse_ffmpeg_args, Input};
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -535,94 +413,5 @@ mod tests {
         assert_eq!(parsed.sandbox_args[1], "https://example.com/input.mov");
         assert_eq!(parsed.sandbox_args[2], "/tmp/cfmpeg/outputs/output_0.mp4");
         assert_eq!(parsed.sandbox_args[3], "/tmp/cfmpeg/outputs/output_1.mp4");
-    }
-
-    #[test]
-    fn warns_when_cpu_encoder_is_selected_with_gpu_execution() {
-        let args = vec![
-            "-i".to_string(),
-            "input.mov".to_string(),
-            "-c:v".to_string(),
-            "libx264".to_string(),
-            "output.mp4".to_string(),
-        ];
-
-        let warning = describe_gpu_compatibility_warning(&args).expect("warning");
-
-        assert!(warning.contains("libx264"));
-        assert!(warning.contains("NVENC"));
-    }
-
-    #[test]
-    fn warns_when_stream_copy_is_selected_with_gpu_execution() {
-        let args = vec![
-            "-i".to_string(),
-            "input.mov".to_string(),
-            "-c:v".to_string(),
-            "copy".to_string(),
-            "output.mp4".to_string(),
-        ];
-
-        let warning = describe_gpu_compatibility_warning(&args).expect("warning");
-
-        assert!(warning.contains("copy"));
-        assert!(warning.contains("GPU encoding"));
-    }
-
-    #[test]
-    fn skips_warning_for_nvenc_video_encoders() {
-        let args = vec![
-            "-i".to_string(),
-            "input.mov".to_string(),
-            "-c:v".to_string(),
-            "hevc_nvenc".to_string(),
-            "output.mp4".to_string(),
-        ];
-
-        assert!(describe_gpu_compatibility_warning(&args).is_none());
-    }
-
-    #[test]
-    fn uses_the_last_explicit_video_encoder() {
-        let args = vec![
-            "-i".to_string(),
-            "input.mov".to_string(),
-            "-c:v".to_string(),
-            "libx264".to_string(),
-            "-c:v".to_string(),
-            "h264_nvenc".to_string(),
-            "output.mp4".to_string(),
-        ];
-
-        assert!(describe_gpu_compatibility_warning(&args).is_none());
-    }
-
-    #[test]
-    fn detects_generic_codec_flags_when_they_look_like_video_codecs() {
-        let args = vec![
-            "-i".to_string(),
-            "input.mov".to_string(),
-            "-codec".to_string(),
-            "libsvtav1".to_string(),
-            "output.mp4".to_string(),
-        ];
-
-        let warning = describe_gpu_compatibility_warning(&args).expect("warning");
-
-        assert!(warning.contains("libsvtav1"));
-    }
-
-    #[test]
-    fn detects_stream_specific_video_codec_flags_with_equals_syntax() {
-        let args = vec![
-            "-i".to_string(),
-            "input.mov".to_string(),
-            "-c:v:0=libx265".to_string(),
-            "output.mp4".to_string(),
-        ];
-
-        let warning = describe_gpu_compatibility_warning(&args).expect("warning");
-
-        assert!(warning.contains("libx265"));
     }
 }

@@ -346,7 +346,7 @@ mod tests {
                 "uploads": [],
                 "ingest": {
                     "mode": "direct_stream",
-                    "stream_url": "https://worker.example.test/stream-gpu",
+                    "stream_url": "https://worker.example.test/stream-highcpu",
                     "claim_url": "https://app.example.test/v1/callbacks/jobs/job_123/stream-claim",
                     "input_format": "mpegts",
                     "stream_strategy": "copy_remux"
@@ -358,7 +358,7 @@ mod tests {
         assert!(response.ingest.is_direct_stream());
         assert_eq!(
             response.ingest.stream_url.as_deref(),
-            Some("https://worker.example.test/stream-gpu")
+            Some("https://worker.example.test/stream-highcpu")
         );
         assert_eq!(response.ingest.input_format.as_deref(), Some("mpegts"));
     }
@@ -477,6 +477,7 @@ pub struct UsageResponse {
     pub period_start: String,
     pub period_end: String,
     pub cpu_minutes: f64,
+    #[allow(dead_code)]
     pub gpu_minutes: f64,
     pub total_cost_cents: u64,
     pub jobs_count: u64,

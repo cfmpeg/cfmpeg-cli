@@ -3,11 +3,6 @@ use serde::{Deserialize, Serialize};
 
 pub const PROFILE_BALANCED: &str = "balanced";
 pub const PROFILE_HIGHCPU: &str = "highcpu";
-pub const PROFILE_GPU: &str = "gpu";
-
-pub const GPU_OFF: &str = "off";
-pub const GPU_PREFER: &str = "prefer";
-pub const GPU_REQUIRED: &str = "required";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteExecutionOptions {
@@ -18,8 +13,6 @@ pub struct RemoteExecutionOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gpu: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
 }
 
@@ -28,16 +21,7 @@ impl RemoteExecutionOptions {
         self.profile.is_none()
             && self.cpu.is_none()
             && self.memory_mb.is_none()
-            && self.gpu.is_none()
             && self.timeout_seconds.is_none()
-    }
-
-    pub fn requests_gpu_execution(&self) -> bool {
-        match self.gpu.as_deref() {
-            Some(GPU_OFF) => false,
-            Some(_) => true,
-            None => self.profile.as_deref() == Some(PROFILE_GPU),
-        }
     }
 
     pub fn merge_defaults(&self, defaults: &Self) -> Self {
@@ -45,30 +29,24 @@ impl RemoteExecutionOptions {
             profile: self.profile.clone().or_else(|| defaults.profile.clone()),
             cpu: self.cpu.or(defaults.cpu),
             memory_mb: self.memory_mb.or(defaults.memory_mb),
-            gpu: self.gpu.clone().or_else(|| defaults.gpu.clone()),
             timeout_seconds: self.timeout_seconds.or(defaults.timeout_seconds),
         }
     }
 
     pub fn requires_strict_remote(&self) -> bool {
-        self.gpu.as_deref() == Some(GPU_REQUIRED)
+        false
     }
 }
 
 pub fn parse_profile(value: &str) -> Result<String> {
     match value {
-        PROFILE_BALANCED | PROFILE_HIGHCPU | PROFILE_GPU => Ok(value.to_string()),
+        PROFILE_BALANCED | PROFILE_HIGHCPU => Ok(value.to_string()),
+        "gpu" => Err(CfmpegError::ParseError(
+            "GPU execution is not currently available; use `--cf-profile highcpu` instead"
+                .to_string(),
+        )),
         _ => Err(CfmpegError::ParseError(format!(
-            "invalid value for --cf-profile: {value} (expected balanced, highcpu, or gpu)"
-        ))),
-    }
-}
-
-pub fn parse_gpu_mode(value: &str) -> Result<String> {
-    match value {
-        GPU_OFF | GPU_PREFER | GPU_REQUIRED => Ok(value.to_string()),
-        _ => Err(CfmpegError::ParseError(format!(
-            "invalid value for --cf-gpu: {value} (expected off, prefer, or required)"
+            "invalid value for --cf-profile: {value} (expected balanced or highcpu)"
         ))),
     }
 }
@@ -175,41 +153,16 @@ pub fn parse_timeout_seconds(value: &str) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        RemoteExecutionOptions, GPU_OFF, GPU_PREFER, GPU_REQUIRED, PROFILE_BALANCED, PROFILE_GPU,
-    };
+    use super::{RemoteExecutionOptions, PROFILE_BALANCED};
 
     #[test]
-    fn detects_gpu_requests_from_mode_or_profile() {
-        assert!(RemoteExecutionOptions {
-            gpu: Some(GPU_PREFER.to_string()),
-            ..RemoteExecutionOptions::default()
-        }
-        .requests_gpu_execution());
-
-        assert!(RemoteExecutionOptions {
-            gpu: Some(GPU_REQUIRED.to_string()),
-            ..RemoteExecutionOptions::default()
-        }
-        .requests_gpu_execution());
-
-        assert!(RemoteExecutionOptions {
-            profile: Some(PROFILE_GPU.to_string()),
-            ..RemoteExecutionOptions::default()
-        }
-        .requests_gpu_execution());
-
-        assert!(!RemoteExecutionOptions {
-            profile: Some(PROFILE_GPU.to_string()),
-            gpu: Some(GPU_OFF.to_string()),
-            ..RemoteExecutionOptions::default()
-        }
-        .requests_gpu_execution());
+    fn remote_execution_is_empty_without_profile_cpu_memory_or_timeout() {
+        assert!(RemoteExecutionOptions::default().is_empty());
 
         assert!(!RemoteExecutionOptions {
             profile: Some(PROFILE_BALANCED.to_string()),
             ..RemoteExecutionOptions::default()
         }
-        .requests_gpu_execution());
+        .is_empty());
     }
 }

@@ -1,7 +1,6 @@
 use crate::error::{CfmpegError, Result};
 use crate::remote::{
-    parse_cpu_cores, parse_gpu_mode, parse_memory_mb, parse_profile, parse_timeout_seconds,
-    RemoteExecutionOptions,
+    parse_cpu_cores, parse_memory_mb, parse_profile, parse_timeout_seconds, RemoteExecutionOptions,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +52,7 @@ pub fn print_help() {
     println!("cfmpeg");
     println!();
     println!("Usage:");
-    println!("  cfmpeg [--local] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-gpu <mode>] [--cf-timeout <duration>] <ffmpeg args...>");
+    println!("  cfmpeg [--local] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-timeout <duration>] <ffmpeg args...>");
     println!("  cfmpeg auth <login|status|logout>");
     println!("  cfmpeg config [path|show|edit]");
     println!("  cfmpeg usage");
@@ -160,14 +159,10 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
                     "--cf-memory",
                 )?)?);
             }
-            _ if arg.starts_with("--cf-gpu=") => {
-                remote.gpu = Some(parse_gpu_mode(value_after_equals(arg, "--cf-gpu"))?);
-            }
-            "--cf-gpu" => {
-                index += 1;
-                remote.gpu = Some(parse_gpu_mode(value_after_flag(
-                    &raw_args, index, "--cf-gpu",
-                )?)?);
+            _ if arg.starts_with("--cf-gpu=") || arg == "--cf-gpu" => {
+                return Err(CfmpegError::ParseError(
+                    "GPU execution is not currently available; remove `--cf-gpu` and use `--cf-profile highcpu` instead".to_string(),
+                ));
             }
             _ if arg.starts_with("--cf-timeout=") => {
                 remote.timeout_seconds = Some(parse_timeout_seconds(value_after_equals(
@@ -247,7 +242,7 @@ fn value_after_flag<'a>(args: &'a [String], index: usize, flag: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::{parse_args, AuthAction, Command, ConfigAction};
-    use crate::remote::{RemoteExecutionOptions, GPU_REQUIRED, PROFILE_GPU};
+    use crate::remote::{RemoteExecutionOptions, PROFILE_HIGHCPU};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -273,12 +268,10 @@ mod tests {
     fn parses_remote_execution_flags_separately_from_ffmpeg_args() {
         let command = parse_args(args(&[
             "--cf-profile",
-            "gpu",
+            "highcpu",
             "--cf-cpu=8",
             "--cf-memory",
             "16g",
-            "--cf-gpu",
-            "required",
             "--cf-timeout=90m",
             "-i",
             "input.mov",
@@ -293,14 +286,29 @@ mod tests {
                 force_local: false,
                 no_download: false,
                 remote: RemoteExecutionOptions {
-                    profile: Some(PROFILE_GPU.to_string()),
+                    profile: Some(PROFILE_HIGHCPU.to_string()),
                     cpu: Some(8),
                     memory_mb: Some(16 * 1024),
-                    gpu: Some(GPU_REQUIRED.to_string()),
                     timeout_seconds: Some(90 * 60),
                 },
             }
         );
+    }
+
+    #[test]
+    fn rejects_gpu_remote_flag() {
+        let error = parse_args(args(&[
+            "--cf-gpu",
+            "required",
+            "-i",
+            "input.mov",
+            "output.mp4",
+        ]))
+        .expect_err("error");
+
+        assert!(error
+            .to_string()
+            .contains("GPU execution is not currently available"));
     }
 
     #[test]

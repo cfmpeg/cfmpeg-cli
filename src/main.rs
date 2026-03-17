@@ -101,7 +101,6 @@ fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
                 remote_profile: config.remote_profile.clone(),
                 remote_cpu: config.remote_cpu,
                 remote_memory_mb: config.remote_memory_mb,
-                remote_gpu: config.remote_gpu.clone(),
                 remote_timeout_seconds: config.remote_timeout_seconds,
             };
 
@@ -153,14 +152,6 @@ async fn run_encode(
         }
 
         return Err(CfmpegError::ApiUnreachable(config.api_base()));
-    }
-
-    if effective_remote.requests_gpu_execution() {
-        if let Some(detail) = parser::describe_gpu_compatibility_warning(ffmpeg_args) {
-            eprintln!(
-                "  warning: GPU remote execution was requested, but {detail}. Use `h264_nvenc`, `hevc_nvenc`, or `av1_nvenc`, or remove the GPU setting."
-            );
-        }
     }
 
     let http_client = Client::builder()
@@ -390,7 +381,6 @@ async fn show_usage() -> Result<()> {
     println!("Current billing period");
     println!("  {} to {}", usage.period_start, usage.period_end);
     println!("  CPU encoding: {:.1} minutes", usage.cpu_minutes);
-    println!("  GPU encoding: {:.1} minutes", usage.gpu_minutes);
     println!("  Total jobs:   {}", usage.jobs_count);
     println!(
         "  Balance:      {}",
@@ -501,7 +491,6 @@ struct DisplayConfig {
     remote_profile: Option<String>,
     remote_cpu: Option<u16>,
     remote_memory_mb: Option<u32>,
-    remote_gpu: Option<String>,
     remote_timeout_seconds: Option<u32>,
 }
 
