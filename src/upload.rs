@@ -1,4 +1,7 @@
-use crate::api::{ApiClient, CompletedMultipartPart, JobIngest, SegmentUploadTarget, UploadTarget};
+use crate::api::{
+    ApiClient, CompletedMultipartPart, JobIngest, SegmentUploadTarget, SegmentUploadTargetsRequest,
+    UploadTarget,
+};
 use crate::error::{CfmpegError, Result};
 use crate::media_tools::ffmpeg_binary;
 use futures::stream::{self, StreamExt};
@@ -15,6 +18,9 @@ use uuid::Uuid;
 
 const MIN_CONCURRENT_UPLOADS: usize = 6;
 const MAX_CONCURRENT_UPLOADS: usize = 24;
+const MIN_CONCURRENT_SEGMENT_UPLOADS: usize = 2;
+const MAX_CONCURRENT_SEGMENT_UPLOADS: usize = 8;
+const SEGMENT_UPLOAD_TARGET_BATCH_MULTIPLIER: usize = 2;
 const MAX_RETRIES: u32 = 3;
 
 pub struct UploadResult {
@@ -192,33 +198,108 @@ async fn upload_closed_segments(
     state: &mut SegmentUploadState,
     include_last_segment: bool,
 ) -> Result<()> {
+    let concurrency = segment_upload_concurrency(context.total_bytes);
+    let batch_size = segment_target_batch_size(context.total_bytes);
+
     loop {
-        let current_path = segment_file_path(context.segment_dir, state.next_upload_index);
-        if !current_path.exists() {
+        let ready_segments = ready_segment_paths(
+            context.segment_dir,
+            state.next_upload_index,
+            include_last_segment,
+            batch_size,
+        );
+
+        if ready_segments.is_empty() {
             return Ok(());
         }
 
-        let next_path = segment_file_path(context.segment_dir, state.next_upload_index + 1);
-        if !include_last_segment && !next_path.exists() {
-            return Ok(());
-        }
-
-        let target = context
+        let targets = context
             .api
-            .request_segment_upload_target(context.job_id, state.next_upload_index)
+            .request_segment_upload_targets(
+                context.job_id,
+                &SegmentUploadTargetsRequest {
+                    start_index: state.next_upload_index,
+                    count: ready_segments.len() as u32,
+                },
+            )
             .await?;
-        let bytes_uploaded =
-            upload_segment_file(context.client, &current_path, &target, &current_path).await?;
 
-        state.uploaded_bytes = (state.uploaded_bytes + bytes_uploaded).min(context.total_bytes);
-        context.progress.set_position(state.uploaded_bytes);
-        tokio::fs::remove_file(&current_path).await?;
-        state.next_upload_index += 1;
+        if targets.len() != ready_segments.len() {
+            return Err(CfmpegError::Protocol(format!(
+                "segment target batch returned {} targets for {} ready segments",
+                targets.len(),
+                ready_segments.len()
+            )));
+        }
+
+        let results: Vec<Result<(u32, PathBuf, u64)>> =
+            stream::iter(ready_segments.into_iter().zip(targets.into_iter()))
+                .map(|((index, path), target)| {
+                    let client = context.client.clone();
+
+                    async move {
+                        let bytes_uploaded =
+                            upload_segment_file(&client, &path, &target, &path).await?;
+
+                        Ok((index, path, bytes_uploaded))
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+
+        let mut uploaded_segments = Vec::with_capacity(results.len());
+        for result in results {
+            uploaded_segments.push(result?);
+        }
+
+        uploaded_segments.sort_by_key(|(index, _, _)| *index);
+
+        for (index, path, bytes_uploaded) in uploaded_segments {
+            if index != state.next_upload_index {
+                return Err(CfmpegError::Protocol(format!(
+                    "segment uploads completed out of order: expected {}, got {}",
+                    state.next_upload_index, index
+                )));
+            }
+
+            state.uploaded_bytes = (state.uploaded_bytes + bytes_uploaded).min(context.total_bytes);
+            context.progress.set_position(state.uploaded_bytes);
+            tokio::fs::remove_file(&path).await?;
+            state.next_upload_index += 1;
+        }
     }
 }
 
 fn segment_file_path(segment_dir: &Path, index: u32) -> PathBuf {
     segment_dir.join(format!("segment_{index:06}.mp4"))
+}
+
+fn ready_segment_paths(
+    segment_dir: &Path,
+    start_index: u32,
+    include_last_segment: bool,
+    limit: usize,
+) -> Vec<(u32, PathBuf)> {
+    let mut ready = Vec::new();
+    let mut index = start_index;
+
+    while ready.len() < limit {
+        let current_path = segment_file_path(segment_dir, index);
+        if !current_path.exists() {
+            break;
+        }
+
+        let next_path = segment_file_path(segment_dir, index + 1);
+        if !include_last_segment && !next_path.exists() {
+            break;
+        }
+
+        ready.push((index, current_path));
+        index += 1;
+    }
+
+    ready
 }
 
 async fn upload_segment_file(
@@ -485,6 +566,27 @@ fn multipart_upload_concurrency(part_count: usize, file_size: u64) -> usize {
     target.clamp(1, MAX_CONCURRENT_UPLOADS).min(part_count)
 }
 
+fn segment_upload_concurrency(file_size: u64) -> usize {
+    let target = if file_size >= 5 * 1024 * 1024 * 1024 {
+        MAX_CONCURRENT_SEGMENT_UPLOADS
+    } else if file_size >= 1024 * 1024 * 1024 {
+        6
+    } else if file_size >= 256 * 1024 * 1024 {
+        4
+    } else {
+        MIN_CONCURRENT_SEGMENT_UPLOADS
+    };
+
+    target.clamp(
+        MIN_CONCURRENT_SEGMENT_UPLOADS,
+        MAX_CONCURRENT_SEGMENT_UPLOADS,
+    )
+}
+
+fn segment_target_batch_size(file_size: u64) -> usize {
+    segment_upload_concurrency(file_size) * SEGMENT_UPLOAD_TARGET_BATCH_MULTIPLIER
+}
+
 fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
     headers
         .get(ETAG)
@@ -494,7 +596,10 @@ fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_size_for_part, extract_multipart_etag, multipart_upload_concurrency};
+    use super::{
+        chunk_size_for_part, extract_multipart_etag, multipart_upload_concurrency,
+        ready_segment_paths, segment_target_batch_size, segment_upload_concurrency,
+    };
     use reqwest::header::{HeaderMap, HeaderValue, ETAG};
 
     #[test]
@@ -538,5 +643,44 @@ mod tests {
         assert_eq!(multipart_upload_concurrency(12, 512 * 1024 * 1024), 8);
         assert_eq!(multipart_upload_concurrency(20, 2 * 1024 * 1024 * 1024), 16);
         assert_eq!(multipart_upload_concurrency(40, 8 * 1024 * 1024 * 1024), 24);
+    }
+
+    #[test]
+    fn scales_segment_upload_concurrency_with_file_size() {
+        assert_eq!(segment_upload_concurrency(128 * 1024 * 1024), 2);
+        assert_eq!(segment_upload_concurrency(512 * 1024 * 1024), 4);
+        assert_eq!(segment_upload_concurrency(2 * 1024 * 1024 * 1024), 6);
+        assert_eq!(segment_upload_concurrency(8 * 1024 * 1024 * 1024), 8);
+        assert_eq!(segment_target_batch_size(2 * 1024 * 1024 * 1024), 12);
+    }
+
+    #[test]
+    fn detects_only_closed_segment_files_until_finalized() {
+        let dir =
+            std::env::temp_dir().join(format!("cfmpeg-ready-segments-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("segment_000000.mp4"), b"a").unwrap();
+        std::fs::write(dir.join("segment_000001.mp4"), b"b").unwrap();
+        std::fs::write(dir.join("segment_000002.mp4"), b"c").unwrap();
+
+        let open_ready = ready_segment_paths(&dir, 0, false, 10);
+        assert_eq!(
+            open_ready
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let final_ready = ready_segment_paths(&dir, 0, true, 10);
+        assert_eq!(
+            final_ready
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

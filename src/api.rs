@@ -94,6 +94,12 @@ pub struct SegmentUploadTarget {
     pub headers: HashMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SegmentUploadTargetsResponse {
+    #[serde(default)]
+    pub targets: Vec<SegmentUploadTarget>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct UploadTarget {
     pub file_id: u64,
@@ -115,6 +121,12 @@ pub struct StartJobRequest {
 #[derive(Debug, Serialize)]
 pub struct CompleteIngestRequest {
     pub segment_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SegmentUploadTargetsRequest {
+    pub start_index: u32,
+    pub count: u32,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -603,22 +615,25 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
-    pub async fn request_segment_upload_target(
+    pub async fn request_segment_upload_targets(
         &self,
         job_id: &str,
-        index: u32,
-    ) -> Result<SegmentUploadTarget> {
+        request: &SegmentUploadTargetsRequest,
+    ) -> Result<Vec<SegmentUploadTarget>> {
         let response = self
             .client
             .post(format!(
-                "{}/jobs/{job_id}/ingest/segments/{index}/upload-target",
+                "{}/jobs/{job_id}/ingest/segments/upload-targets",
                 self.base_url
             ))
             .bearer_auth(&self.api_key)
+            .json(request)
             .send()
             .await?;
 
-        self.handle_response(response).await
+        let payload: SegmentUploadTargetsResponse = self.handle_response(response).await?;
+
+        Ok(payload.targets)
     }
 
     pub async fn complete_segmented_ingest(
