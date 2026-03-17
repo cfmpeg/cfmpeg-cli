@@ -5,8 +5,8 @@ use crate::remote::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const DEFAULT_API_BASE: &str = "https://api.cfmpeg.dev/v1";
-const DEFAULT_WEB_BASE: &str = "https://cfmpeg.dev";
+const DEFAULT_API_BASE: &str = "https://cfmpeg.com/v1";
+const DEFAULT_WEB_BASE: &str = "https://cfmpeg.com";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -242,10 +242,10 @@ mod tests {
     fn web_base_defaults_to_public_site_for_default_api_base() {
         let config = Config::default();
 
-        assert_eq!(config.web_base(), "https://cfmpeg.dev");
+        assert_eq!(config.web_base(), "https://cfmpeg.com");
         assert_eq!(
             config.dashboard_api_keys_url(),
-            "https://cfmpeg.dev/dashboard/api-keys"
+            "https://cfmpeg.com/dashboard/api-keys"
         );
     }
 

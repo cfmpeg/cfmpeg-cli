@@ -5,7 +5,7 @@ edition = "2021"
 description = "Cloud ffmpeg — run ffmpeg commands on powerful remote containers"
 license = "MIT"
 repository = "https://github.com/aarondfrancis/cfmpeg"
-homepage = "https://cfmpeg.dev"
+homepage = "https://cfmpeg.com"
 keywords = ["ffmpeg", "video", "encoding", "cloud"]
 categories = ["command-line-utilities", "multimedia::video"]
 

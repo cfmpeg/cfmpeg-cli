@@ -21,7 +21,7 @@ No Docker. No Python. No cloud credentials. Install, authenticate, go.
 brew install aarondfrancis/homebrew-tap/cfmpeg
 
 # Linux
-curl -fsSL https://cfmpeg.dev/install.sh | sh
+curl -fsSL https://cfmpeg.com/install.sh | sh
 
 # From source
 cargo install cfmpeg
@@ -87,7 +87,7 @@ Config lives at `~/.config/cfmpeg/config.toml`:
 
 ```toml
 api_key = "cfm_xxxxxxxxxxxx"
-api_base = "https://api.cfmpeg.dev/v1"
+api_base = "https://cfmpeg.com/v1"
 local_fallback = true
 remote_profile = "highcpu"
 remote_cpu = 8

@@ -362,7 +362,7 @@ mod tests {
     fn streams_progress_for_remote_hosts() {
         let client = ApiClient {
             client: reqwest::Client::new(),
-            base_url: "https://api.cfmpeg.dev/v1".to_string(),
+            base_url: "https://cfmpeg.com/v1".to_string(),
             api_key: "cfm_testing".to_string(),
         };
 
