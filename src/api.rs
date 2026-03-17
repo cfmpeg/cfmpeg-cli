@@ -24,6 +24,8 @@ pub struct CreateJobRequest {
     pub outputs: Vec<String>,
     #[serde(skip_serializing_if = "RemoteExecutionOptions::is_empty")]
     pub execution: RemoteExecutionOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_delivery: Option<OutputDeliveryRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +44,8 @@ pub struct CreateJobResponse {
     pub uploads: Vec<UploadTarget>,
     #[serde(default)]
     pub ingest: JobIngest,
+    #[serde(default)]
+    pub output_delivery: JobOutputDelivery,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,31 @@ pub struct JobIngest {
     pub segment_duration_seconds: Option<u64>,
     #[serde(default)]
     pub upload_target_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutputDeliveryRequest {
+    pub mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JobOutputDelivery {
+    #[serde(default = "default_output_delivery_mode")]
+    pub mode: String,
+}
+
+impl Default for JobOutputDelivery {
+    fn default() -> Self {
+        Self {
+            mode: default_output_delivery_mode(),
+        }
+    }
+}
+
+impl JobOutputDelivery {
+    pub fn is_progressive_batches(&self) -> bool {
+        self.mode == "progressive_batches"
+    }
 }
 
 impl JobIngest {
@@ -186,6 +215,10 @@ where
 
 fn default_ingest_mode() -> String {
     "durable".to_string()
+}
+
+fn default_output_delivery_mode() -> String {
+    "final_artifact".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,11 +507,32 @@ pub struct JobProgress {
 
 #[derive(Debug, Deserialize)]
 pub struct JobOutputResponse {
+    #[allow(dead_code)]
+    #[serde(default = "default_output_delivery_mode")]
+    pub delivery_mode: String,
     pub outputs: Vec<OutputFile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JobOutputBatchesResponse {
+    #[serde(default = "default_output_delivery_mode")]
+    pub delivery_mode: String,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub batches: Vec<OutputBatch>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputFile {
+    pub filename: String,
+    pub download_url: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputBatch {
+    pub index: u32,
     pub filename: String,
     pub download_url: String,
     pub size_bytes: u64,
@@ -687,6 +741,17 @@ impl ApiClient {
         let response = self
             .client
             .get(format!("{}/jobs/{job_id}/output", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn get_output_batches(&self, job_id: &str) -> Result<JobOutputBatchesResponse> {
+        let response = self
+            .client
+            .get(format!("{}/jobs/{job_id}/output-batches", self.base_url))
             .bearer_auth(&self.api_key)
             .send()
             .await?;

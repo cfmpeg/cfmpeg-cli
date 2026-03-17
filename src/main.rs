@@ -14,7 +14,7 @@ mod upload;
 
 use crate::api::{
     ApiClient, CompleteIngestRequest, CompletedMultipartUpload, CreateJobRequest, JobInput,
-    StartJobRequest,
+    OutputDeliveryRequest, StartJobRequest,
 };
 use crate::cli::{AuthAction, Command, ConfigAction};
 use crate::config::Config;
@@ -24,6 +24,10 @@ use console::style;
 use reqwest::Client;
 use serde::Serialize;
 use std::process;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[tokio::main]
 async fn main() {
@@ -198,6 +202,11 @@ async fn run_encode(
         inputs: job_inputs,
         outputs,
         execution: effective_remote.clone(),
+        output_delivery: (!no_download && parsed.outputs.len() == 1).then(|| {
+            OutputDeliveryRequest {
+                mode: "progressive_batches".to_string(),
+            }
+        }),
     };
 
     let job = match api.create_job(&create_job_request).await {
@@ -277,6 +286,14 @@ async fn run_encode(
             "  {} segmented ingest enabled for this job",
             style("->").cyan()
         );
+        let use_progressive_batches = job.output_delivery.is_progressive_batches() && !no_download;
+
+        if use_progressive_batches {
+            eprintln!(
+                "  {} progressive batch downloads enabled for this job",
+                style("->").cyan()
+            );
+        }
         eprintln!();
 
         api.prepare_job(&job.job_id).await?;
@@ -286,7 +303,51 @@ async fn run_encode(
         eprintln!();
         api.complete_segmented_ingest(&job.job_id, &CompleteIngestRequest { segment_count })
             .await?;
-        job::wait_for_completion(&api, &http_client, &job.job_id).await?;
+
+        let stop_downloads = Arc::new(AtomicBool::new(false));
+        let progressive_download = if use_progressive_batches {
+            let download_api = api.clone();
+            let download_client = http_client.clone();
+            let job_id = job.job_id.clone();
+            let output_path = parsed.outputs[0].path.clone();
+            let stop = Arc::clone(&stop_downloads);
+
+            Some(tokio::spawn(async move {
+                download::download_progressive_batches(
+                    &download_api,
+                    &download_client,
+                    &job_id,
+                    &output_path,
+                    stop,
+                )
+                .await
+            }))
+        } else {
+            None
+        };
+
+        let completion_result = job::wait_for_completion(&api, &http_client, &job.job_id).await;
+        stop_downloads.store(true, Ordering::Relaxed);
+
+        match (completion_result, progressive_download) {
+            (Ok(()), Some(handle)) => {
+                handle.await.map_err(|error| {
+                    CfmpegError::JobFailed(format!("progressive download task failed: {error}"))
+                })??;
+
+                eprintln!();
+                eprintln!("  {} complete.", style("ok").green().bold());
+                return Ok(());
+            }
+            (Err(error), Some(handle)) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err(error);
+            }
+            (result, None) => {
+                result?;
+            }
+        }
     } else {
         if !local_inputs.is_empty() {
             if let Err(error) = api.prepare_job(&job.job_id).await {

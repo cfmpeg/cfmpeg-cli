@@ -1,5 +1,6 @@
-use crate::api::OutputFile;
+use crate::api::{ApiClient, OutputFile};
 use crate::error::{CfmpegError, Result};
+use crate::media_tools::ffmpeg_binary;
 use crate::parser::Output;
 use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -7,14 +8,21 @@ use reqwest::header::CONTENT_RANGE;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::process::Command;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const PARALLEL_DOWNLOAD_THRESHOLD_BYTES: u64 = 128 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_CHUNK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONCURRENT_DOWNLOADS: usize = 8;
 const DOWNLOAD_MAX_RETRIES: u32 = 3;
+const PROGRESSIVE_BATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn download_outputs(
     client: &Client,
@@ -58,6 +66,98 @@ pub fn print_output_urls(remote_outputs: &[OutputFile]) {
     for line in format_output_urls(remote_outputs) {
         println!("{line}");
     }
+}
+
+pub async fn download_progressive_batches(
+    api: &ApiClient,
+    client: &Client,
+    job_id: &str,
+    target_path: &Path,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    let temp_dir = std::env::temp_dir().join(format!("cfmpeg-output-batches-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&temp_dir).await?;
+
+    let mut downloaded: HashMap<u32, PathBuf> = HashMap::new();
+
+    loop {
+        let response = api.get_output_batches(job_id).await?;
+
+        if response.delivery_mode != "progressive_batches" {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            return Err(CfmpegError::Protocol(
+                "job does not expose progressive batch outputs".to_string(),
+            ));
+        }
+
+        for batch in response.batches {
+            if downloaded.contains_key(&batch.index) {
+                continue;
+            }
+
+            let batch_path = temp_dir.join(format!("batch_{:05}.mp4", batch.index));
+            download_file(
+                client,
+                &OutputFile {
+                    filename: batch.filename,
+                    download_url: batch.download_url,
+                    size_bytes: batch.size_bytes,
+                },
+                &batch_path,
+            )
+            .await?;
+            downloaded.insert(batch.index, batch_path);
+        }
+
+        if stop.load(Ordering::Relaxed) || response.complete {
+            break;
+        }
+
+        tokio::time::sleep(PROGRESSIVE_BATCH_POLL_INTERVAL).await;
+    }
+
+    let response = api.get_output_batches(job_id).await?;
+    for batch in response.batches {
+        if downloaded.contains_key(&batch.index) {
+            continue;
+        }
+
+        let batch_path = temp_dir.join(format!("batch_{:05}.mp4", batch.index));
+        download_file(
+            client,
+            &OutputFile {
+                filename: batch.filename,
+                download_url: batch.download_url,
+                size_bytes: batch.size_bytes,
+            },
+            &batch_path,
+        )
+        .await?;
+        downloaded.insert(batch.index, batch_path);
+    }
+
+    let mut ordered_batches: Vec<(u32, PathBuf)> = downloaded.into_iter().collect();
+    ordered_batches.sort_by_key(|(index, _)| *index);
+
+    if ordered_batches.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        return Err(CfmpegError::Protocol(
+            "job completed without any progressive output batches".to_string(),
+        ));
+    }
+
+    concat_progressive_batches(
+        &ordered_batches
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>(),
+        target_path,
+    )
+    .await?;
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    Ok(())
 }
 
 async fn download_file(
@@ -333,6 +433,63 @@ fn format_output_urls(remote_outputs: &[OutputFile]) -> Vec<String> {
         .iter()
         .map(|output| format!("{}\t{}", output.filename, output.download_url))
         .collect()
+}
+
+async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path) -> Result<()> {
+    if batch_paths.is_empty() {
+        return Err(CfmpegError::Protocol(
+            "cannot concatenate an empty batch list".to_string(),
+        ));
+    }
+
+    if let Some(parent) = target_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let manifest_path =
+        std::env::temp_dir().join(format!("cfmpeg-output-batches-{}.txt", Uuid::new_v4()));
+    let manifest = batch_paths
+        .iter()
+        .map(|path| format!("file '{}'\n", path.display()))
+        .collect::<String>();
+    tokio::fs::write(&manifest_path, manifest).await?;
+
+    let ffmpeg = ffmpeg_binary()?;
+    let output = Command::new(ffmpeg)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-nostdin")
+        .arg("-y")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&manifest_path)
+        .arg("-c")
+        .arg("copy")
+        .arg(target_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    let _ = tokio::fs::remove_file(&manifest_path).await;
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(CfmpegError::Download {
+            filename: target_path.display().to_string(),
+            reason: if detail.is_empty() {
+                format!("ffmpeg concat exited with status {}", output.status)
+            } else {
+                detail
+            },
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
