@@ -6,7 +6,7 @@ use crate::error::{CfmpegError, Result};
 use crate::media_tools::ffmpeg_binary;
 use futures::stream::{self, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::header::{HeaderMap, ETAG};
+use reqwest::header::{HeaderMap, CONTENT_LENGTH, ETAG};
 use reqwest::Client;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,13 +14,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 const MIN_CONCURRENT_UPLOADS: usize = 6;
 const MAX_CONCURRENT_UPLOADS: usize = 24;
 const MIN_CONCURRENT_SEGMENT_UPLOADS: usize = 2;
 const MAX_CONCURRENT_SEGMENT_UPLOADS: usize = 8;
-const SEGMENT_UPLOAD_TARGET_BATCH_MULTIPLIER: usize = 2;
 const MAX_RETRIES: u32 = 3;
 
 pub struct UploadResult {
@@ -308,9 +308,18 @@ async fn upload_segment_file(
     target: &SegmentUploadTarget,
     display_path: &Path,
 ) -> Result<u64> {
-    let data = tokio::fs::read(file_path).await?;
+    let file_size = tokio::fs::metadata(file_path).await?.len();
 
     for attempt in 0..MAX_RETRIES {
+        let input =
+            tokio::fs::File::open(file_path)
+                .await
+                .map_err(|error| CfmpegError::Upload {
+                    filename: display_path.display().to_string(),
+                    reason: error.to_string(),
+                })?;
+        let body = reqwest::Body::wrap_stream(ReaderStream::new(input));
+
         let mut request = client.put(&target.upload_url);
 
         for (name, value) in &target.headers {
@@ -329,8 +338,10 @@ async fn upload_segment_file(
             request = request.header("Content-Type", "video/mp4");
         }
 
-        match request.body(data.clone()).send().await {
-            Ok(response) if response.status().is_success() => return Ok(data.len() as u64),
+        request = request.header(CONTENT_LENGTH, file_size.to_string());
+
+        match request.body(body).send().await {
+            Ok(response) if response.status().is_success() => return Ok(file_size),
             Ok(response) => {
                 if attempt == MAX_RETRIES - 1 {
                     return Err(CfmpegError::Upload {
@@ -584,7 +595,7 @@ fn segment_upload_concurrency(file_size: u64) -> usize {
 }
 
 fn segment_target_batch_size(file_size: u64) -> usize {
-    segment_upload_concurrency(file_size) * SEGMENT_UPLOAD_TARGET_BATCH_MULTIPLIER
+    segment_upload_concurrency(file_size)
 }
 
 fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
@@ -651,7 +662,7 @@ mod tests {
         assert_eq!(segment_upload_concurrency(512 * 1024 * 1024), 4);
         assert_eq!(segment_upload_concurrency(2 * 1024 * 1024 * 1024), 6);
         assert_eq!(segment_upload_concurrency(8 * 1024 * 1024 * 1024), 8);
-        assert_eq!(segment_target_batch_size(2 * 1024 * 1024 * 1024), 12);
+        assert_eq!(segment_target_batch_size(2 * 1024 * 1024 * 1024), 6);
     }
 
     #[test]
