@@ -153,6 +153,11 @@ pub struct CompleteIngestRequest {
 }
 
 #[derive(Debug, Serialize)]
+pub struct IngestProgressRequest {
+    pub uploaded_segment_count: u32,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SegmentUploadTargetsRequest {
     pub start_index: u32,
     pub count: u32,
@@ -698,6 +703,22 @@ impl ApiClient {
         let response = self
             .client
             .post(format!("{}/jobs/{job_id}/ingest/complete", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(request)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn report_segmented_ingest_progress(
+        &self,
+        job_id: &str,
+        request: &IngestProgressRequest,
+    ) -> Result<JobStatus> {
+        let response = self
+            .client
+            .post(format!("{}/jobs/{job_id}/ingest/progress", self.base_url))
             .bearer_auth(&self.api_key)
             .json(request)
             .send()

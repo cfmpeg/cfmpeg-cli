@@ -1,6 +1,6 @@
 use crate::api::{
-    ApiClient, CompletedMultipartPart, JobIngest, SegmentUploadTarget, SegmentUploadTargetsRequest,
-    UploadTarget,
+    ApiClient, CompletedMultipartPart, IngestProgressRequest, JobIngest, SegmentUploadTarget,
+    SegmentUploadTargetsRequest, UploadTarget,
 };
 use crate::error::{CfmpegError, Result};
 use crate::media_tools::ffmpeg_binary;
@@ -268,6 +268,16 @@ async fn upload_closed_segments(
             tokio::fs::remove_file(&path).await?;
             state.next_upload_index += 1;
         }
+
+        context
+            .api
+            .report_segmented_ingest_progress(
+                context.job_id,
+                &IngestProgressRequest {
+                    uploaded_segment_count: state.next_upload_index,
+                },
+            )
+            .await?;
     }
 }
 
