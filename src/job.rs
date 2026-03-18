@@ -188,6 +188,11 @@ fn update_progress_bar(progress: &ProgressBar, job_progress: &JobProgress) {
     if let Some(time) = job_progress.time.as_deref() {
         parts.push(format!("time={time}"));
     }
+    if let Some(detail) = job_progress.detail.as_deref() {
+        parts.push(format!("activity={detail}"));
+    } else if let Some(stage) = job_progress.stage.as_deref() {
+        parts.push(format!("activity={}", stage.replace('_', " ")));
+    }
     if let Some(speed) = job_progress.speed.as_deref() {
         parts.push(format!("speed={speed}"));
     }

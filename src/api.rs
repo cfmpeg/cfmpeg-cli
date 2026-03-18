@@ -497,6 +497,8 @@ mod tests {
 #[derive(Debug, Deserialize, Clone)]
 pub struct JobProgress {
     #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
     pub frame: Option<u64>,
     #[serde(default)]
     pub fps: Option<f64>,
@@ -506,6 +508,8 @@ pub struct JobProgress {
     pub size_kb: Option<u64>,
     #[serde(default)]
     pub speed: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
     #[serde(default)]
     pub time: Option<String>,
 }
