@@ -233,7 +233,7 @@ async fn upload_closed_segments(
         }
 
         let results: Vec<Result<(u32, PathBuf, u64)>> =
-            stream::iter(ready_segments.into_iter().zip(targets.into_iter()))
+            stream::iter(ready_segments.into_iter().zip(targets))
                 .map(|((index, path), target)| {
                     let client = context.client.clone();
 
