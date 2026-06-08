@@ -327,6 +327,47 @@ fn release_workflow_normalizes_versions_before_running_release_steps() {
 }
 
 #[test]
+fn release_workflow_skips_the_version_bump_commit_when_manifest_is_current() {
+    let workflow = workflow(".github/workflows/release.yml");
+    let release_job = workflow_job(&workflow, "release");
+    let commit_step = workflow_step(release_job, "Commit version bump");
+    let commit_script = render(
+        commit_step["run"]
+            .as_str()
+            .expect("commit version bump step should have a run script"),
+        &[("${{ steps.version.outputs.number }}", "0.1.0")],
+    );
+
+    let workspace = tempdir().expect("failed to create workflow tempdir");
+    let stub_bin = workspace.path().join("bin");
+    fs::create_dir_all(&stub_bin).expect("failed to create stub bin directory");
+
+    write_executable(
+        &stub_bin.join("git"),
+        r#"#!/bin/bash
+if [ "$1" = "add" ]; then
+  exit 0
+fi
+
+if [ "$1" = "diff" ] && [ "$2" = "--cached" ] && [ "$3" = "--quiet" ]; then
+  exit 0
+fi
+
+if [ "$1" = "commit" ]; then
+  echo "commit should not run when there are no staged manifest changes" >&2
+  exit 1
+fi
+
+echo "unexpected git command: $*" >&2
+exit 1
+"#,
+    );
+
+    let output = run_script(&commit_script, workspace.path(), Some(&stub_bin), &[]);
+    assert_success(&output);
+}
+
+#[test]
 fn release_workflow_publishes_the_crate_to_crates_io() {
     let workflow = workflow(".github/workflows/release.yml");
     let publish_job = workflow_job(&workflow, "publish-crate");

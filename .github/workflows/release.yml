@@ -88,6 +88,10 @@ jobs:
       - name: Commit version bump
         run: |
           git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "No manifest changes to commit for v${{ steps.version.outputs.number }}."
+            exit 0
+          fi
           git commit -m "Release v${{ steps.version.outputs.number }}"
 
       - name: Create and push tag
