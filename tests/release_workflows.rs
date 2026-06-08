@@ -461,6 +461,52 @@ exit 1
 }
 
 #[test]
+fn release_workflow_skips_mutating_steps_when_release_tag_already_exists() {
+    let workflow = workflow(".github/workflows/release.yml");
+    let release_job = workflow_job(&workflow, "release");
+    let steps = release_job["steps"]
+        .as_sequence()
+        .expect("release job should have steps");
+
+    let existing_tag_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Check existing tag"))
+        .expect("missing existing tag check step");
+    let bump_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Bump version"))
+        .expect("missing version bump step");
+
+    assert!(
+        existing_tag_index < bump_index,
+        "existing tag must be checked before mutating release steps"
+    );
+
+    let existing_tag_script = steps[existing_tag_index]["run"]
+        .as_str()
+        .expect("existing tag check step should have a run script");
+    assert!(existing_tag_script.contains("git ls-remote --exit-code --tags origin"));
+    assert!(existing_tag_script.contains("refs/tags/v${{ steps.version.outputs.number }}"));
+    assert!(existing_tag_script.contains("exists=true"));
+    assert!(existing_tag_script.contains("exists=false"));
+
+    for step_name in [
+        "Bump version",
+        "Verify manifest after bump",
+        "Commit version bump",
+        "Create and push tag",
+        "Push to main",
+    ] {
+        let step = workflow_step(release_job, step_name);
+        assert_eq!(
+            step["if"].as_str(),
+            Some("steps.existing_tag.outputs.exists != 'true'"),
+            "{step_name} should be skipped when the release tag already exists"
+        );
+    }
+}
+
+#[test]
 fn release_workflow_publishes_the_crate_to_crates_io() {
     let workflow = workflow(".github/workflows/release.yml");
     let publish_job = workflow_job(&workflow, "publish-crate");

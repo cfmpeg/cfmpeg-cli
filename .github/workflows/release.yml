@@ -79,13 +79,26 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Check existing tag
+        id: existing_tag
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v${{ steps.version.outputs.number }}" >/dev/null 2>&1; then
+            echo "Release tag v${{ steps.version.outputs.number }} already exists; skipping manifest mutation."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Bump version
+        if: steps.existing_tag.outputs.exists != 'true'
         run: python3 scripts/set-version.py "${{ steps.version.outputs.number }}"
 
       - name: Verify manifest after bump
+        if: steps.existing_tag.outputs.exists != 'true'
         run: cargo build --locked
 
       - name: Commit version bump
+        if: steps.existing_tag.outputs.exists != 'true'
         run: |
           git add Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
@@ -95,11 +108,13 @@ jobs:
           git commit -m "Release v${{ steps.version.outputs.number }}"
 
       - name: Create and push tag
+        if: steps.existing_tag.outputs.exists != 'true'
         run: |
           git tag "v${{ steps.version.outputs.number }}"
           git push origin "v${{ steps.version.outputs.number }}"
 
       - name: Push to main
+        if: steps.existing_tag.outputs.exists != 'true'
         run: git push
 
   release-binaries:
