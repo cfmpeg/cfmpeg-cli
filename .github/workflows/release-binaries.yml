@@ -63,6 +63,10 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Install macOS ffmpeg build dependencies
+        if: matrix.asset_name == 'cfmpeg-darwin-x64'
+        run: brew install nasm
+
       - name: Install ffmpeg build dependencies
         if: matrix.asset_name == 'cfmpeg-linux-x64'
         run: |

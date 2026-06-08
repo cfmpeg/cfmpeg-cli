@@ -315,6 +315,40 @@ fn release_binaries_workflow_uses_current_macos_intel_runner_for_x64() {
 }
 
 #[test]
+fn release_binaries_workflow_installs_macos_x64_ffmpeg_build_dependencies() {
+    let workflow = workflow(".github/workflows/release-binaries.yml");
+    let build_job = workflow_job(&workflow, "build-binaries");
+    let steps = build_job["steps"]
+        .as_sequence()
+        .expect("build-binaries job should have steps");
+
+    let install_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Install macOS ffmpeg build dependencies"))
+        .expect("missing macOS ffmpeg build dependency install step");
+    let helper_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Build bundled ffmpeg helpers"))
+        .expect("missing ffmpeg helper build step");
+
+    assert!(
+        install_index < helper_index,
+        "ffmpeg build dependencies must be installed before building helpers"
+    );
+
+    let install_step = &steps[install_index];
+    assert_eq!(
+        install_step["if"].as_str(),
+        Some("matrix.asset_name == 'cfmpeg-darwin-x64'")
+    );
+
+    let install_script = install_step["run"]
+        .as_str()
+        .expect("macOS dependency install step should have a run script");
+    assert!(install_script.contains("brew install nasm"));
+}
+
+#[test]
 fn release_binaries_workflow_installs_linux_x64_ffmpeg_build_dependencies() {
     let workflow = workflow(".github/workflows/release-binaries.yml");
     let build_job = workflow_job(&workflow, "build-binaries");
