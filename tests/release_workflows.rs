@@ -526,6 +526,56 @@ fn release_workflow_publishes_the_crate_to_crates_io() {
 }
 
 #[test]
+fn release_workflow_skips_crates_io_publish_when_version_already_exists() {
+    let workflow = workflow(".github/workflows/release.yml");
+    let publish_job = workflow_job(&workflow, "publish-crate");
+    let steps = publish_job["steps"]
+        .as_sequence()
+        .expect("publish-crate job should have steps");
+
+    let existing_crate_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Check existing crate version"))
+        .expect("missing existing crate version check step");
+    let require_token_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Require crates.io token"))
+        .expect("missing crates.io token requirement step");
+    let publish_index = steps
+        .iter()
+        .position(|step| step["name"].as_str() == Some("Publish crate to crates.io"))
+        .expect("missing crates.io publish step");
+
+    assert!(
+        existing_crate_index < require_token_index,
+        "existing crate version must be checked before requiring a publish token"
+    );
+    assert!(
+        existing_crate_index < publish_index,
+        "existing crate version must be checked before publishing"
+    );
+
+    let existing_crate_script = steps[existing_crate_index]["run"]
+        .as_str()
+        .expect("existing crate version check step should have a run script");
+    assert!(existing_crate_script.contains("https://crates.io/api/v1/crates/cfmpeg/"));
+    assert!(existing_crate_script.contains("exists=true"));
+    assert!(existing_crate_script.contains("exists=false"));
+
+    let require_token_step = workflow_step(publish_job, "Require crates.io token");
+    assert_eq!(
+        require_token_step["if"].as_str(),
+        Some("env.CARGO_REGISTRY_TOKEN == '' && steps.existing_crate.outputs.exists != 'true'")
+    );
+
+    let publish_step = workflow_step(publish_job, "Publish crate to crates.io");
+    assert_eq!(
+        publish_step["if"].as_str(),
+        Some("env.CARGO_REGISTRY_TOKEN != '' && steps.existing_crate.outputs.exists != 'true'")
+    );
+}
+
+#[test]
 fn release_workflow_generates_and_commits_the_homebrew_formula_from_release_assets() {
     let workflow = workflow(".github/workflows/release.yml");
     let update_homebrew_job = workflow_job(&workflow, "update-homebrew");
