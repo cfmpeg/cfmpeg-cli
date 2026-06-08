@@ -299,6 +299,22 @@ fn release_binaries_workflow_normalizes_tags_and_packages_release_assets() {
 }
 
 #[test]
+fn release_binaries_workflow_uses_current_macos_intel_runner_for_x64() {
+    let workflow = workflow(".github/workflows/release-binaries.yml");
+    let build_job = workflow_job(&workflow, "build-binaries");
+
+    let matrix = build_job["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .expect("release-binaries matrix should be a sequence");
+    let darwin_x64 = matrix
+        .iter()
+        .find(|entry| entry["asset_name"].as_str() == Some("cfmpeg-darwin-x64"))
+        .expect("missing darwin x64 matrix entry");
+
+    assert_eq!(darwin_x64["os"].as_str(), Some("macos-15-intel"));
+}
+
+#[test]
 fn release_binaries_workflow_installs_linux_x64_ffmpeg_build_dependencies() {
     let workflow = workflow(".github/workflows/release-binaries.yml");
     let build_job = workflow_job(&workflow, "build-binaries");
