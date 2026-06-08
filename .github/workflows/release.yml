@@ -105,6 +105,35 @@ jobs:
     with:
       tag: v${{ needs.release.outputs.version }}
 
+  publish-crate:
+    needs: release
+    runs-on: ubuntu-latest
+    if: github.actor == 'aarondfrancis'
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/v${{ needs.release.outputs.version }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Require crates.io token
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: |
+          echo "::error::CARGO_REGISTRY_TOKEN is not configured."
+          exit 1
+
+      - name: Publish crate to crates.io
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
+
   update-homebrew:
     needs:
       - release
@@ -119,6 +148,8 @@ jobs:
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           REPOSITORY_OWNER: ${{ github.repository_owner }}
+          HOMEBREW_TAP_OWNER: cfmpeg
+          HOMEBREW_TAP_REPO: cfmpeg-homebrew-tap
         run: |
           set -euo pipefail
 
@@ -166,7 +197,7 @@ jobs:
             fi
           done
 
-          git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/${REPOSITORY_OWNER}/homebrew-tap.git" "$TAP_DIR"
+          git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/${HOMEBREW_TAP_OWNER}/${HOMEBREW_TAP_REPO}.git" "$TAP_DIR"
           cd "$TAP_DIR"
 
           cat > "$FORMULA_PATH" <<EOF
@@ -230,19 +261,21 @@ jobs:
     env:
       VERSION: ${{ needs.release.outputs.version }}
       REPOSITORY_OWNER: ${{ github.repository_owner }}
+      HOMEBREW_TAP: cfmpeg/cfmpeg-homebrew-tap
+      HOMEBREW_TAP_URL: https://github.com/cfmpeg/cfmpeg-homebrew-tap.git
 
     steps:
       - name: Smoke test Homebrew install
         run: |
           set -euo pipefail
 
-          brew tap "${REPOSITORY_OWNER}/homebrew-tap"
+          brew tap "${HOMEBREW_TAP}" "${HOMEBREW_TAP_URL}"
 
           for attempt in {1..8}; do
             if brew list --versions cfmpeg >/dev/null 2>&1; then
-              brew upgrade "${REPOSITORY_OWNER}/homebrew-tap/cfmpeg" || true
+              brew upgrade "${HOMEBREW_TAP}/cfmpeg" || true
             else
-              brew install "${REPOSITORY_OWNER}/homebrew-tap/cfmpeg" || true
+              brew install "${HOMEBREW_TAP}/cfmpeg" || true
             fi
 
             INSTALLED_VERSION="$(brew list --versions cfmpeg 2>/dev/null | awk '{print $2}')"

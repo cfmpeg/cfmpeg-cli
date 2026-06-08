@@ -18,7 +18,8 @@ No Docker. No Python. No cloud credentials. Install, authenticate, go.
 
 ```bash
 # macOS
-brew install aarondfrancis/homebrew-tap/cfmpeg
+brew tap cfmpeg/cfmpeg-homebrew-tap https://github.com/cfmpeg/cfmpeg-homebrew-tap.git
+brew install cfmpeg/cfmpeg-homebrew-tap/cfmpeg
 
 # Linux
 curl -fsSL https://cfmpeg.com/install.sh | sh
@@ -27,7 +28,7 @@ curl -fsSL https://cfmpeg.com/install.sh | sh
 cargo install cfmpeg
 ```
 
-Prebuilt releases bundle helper `ffmpeg` and `ffprobe` binaries for cfmpeg's internal remuxing and future media segmentation paths.
+Prebuilt releases bundle helper `ffmpeg` and `ffprobe` binaries for cfmpeg's internal remuxing and segmented local-file ingest paths.
 If you install from source instead, keep `ffmpeg` available on `PATH` or point cfmpeg at an explicit helper with `CFMPEG_FFMPEG_BINARY`.
 
 ## Quick Start
@@ -64,7 +65,7 @@ cfmpeg -i https://example.com/raw.mov -c:v libx264 output.mp4
 - **Parallel multipart uploads** — large files upload fast with chunked parallel transfers
 - **Real-time progress** — streaming progress display, just like local ffmpeg
 - **Automatic local fallback** — if the API is unreachable, cfmpeg falls back to local ffmpeg
-- **Output caching** — same input + same args = instant cached result
+- **Automatic output delivery** — completed outputs are downloaded back to your local filesystem
 - **URL passthrough** — remote URLs are fetched directly by the container, no upload needed
 
 ## Authentication
@@ -109,9 +110,13 @@ cfmpeg usage          # Current billing period summary
 
 Billed per second of container wall-clock time:
 
-| Tier | Rate |
-|------|------|
-| CPU  | $0.01/min |
+Remote jobs are priced from the resources reserved for the resolved execution
+profile, not from a flat CPU tier. The server combines the current CPU core-minute
+and memory GiB-minute rates, applies the configured minimum billable duration,
+and records the exact charge against your prepaid balance.
+
+Use the billing dashboard for the current profile quotes, and `cfmpeg usage` for
+your current balance and job charges.
 
 ## Local Fallback
 
@@ -136,7 +141,7 @@ The GitHub Actions workflow in `.github/workflows/ci.yml` runs the same checks o
 
 ## Releases
 
-Homebrew releases are published from GitHub Actions to `aarondfrancis/homebrew-tap` using the release workflows in `.github/workflows/`.
+Homebrew releases are published from GitHub Actions to `cfmpeg/cfmpeg-homebrew-tap` using the release workflows in `.github/workflows/`.
 
 ## License
 
