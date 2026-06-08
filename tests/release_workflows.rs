@@ -558,7 +558,8 @@ fn release_workflow_skips_crates_io_publish_when_version_already_exists() {
     let existing_crate_script = steps[existing_crate_index]["run"]
         .as_str()
         .expect("existing crate version check step should have a run script");
-    assert!(existing_crate_script.contains("https://crates.io/api/v1/crates/cfmpeg/"));
+    assert!(existing_crate_script.contains("cargo search cfmpeg --limit 5"));
+    assert!(!existing_crate_script.contains("https://crates.io/api/v1/crates/cfmpeg/"));
     assert!(existing_crate_script.contains("exists=true"));
     assert!(existing_crate_script.contains("exists=false"));
 
