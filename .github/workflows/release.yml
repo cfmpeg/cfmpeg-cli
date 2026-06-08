@@ -18,7 +18,7 @@ env:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    if: github.actor == 'aarondfrancis'
+    if: github.repository == 'cfmpeg/cfmpeg-cli'
 
     steps:
       - name: Checkout
@@ -47,7 +47,7 @@ jobs:
   release:
     needs: ci
     runs-on: ubuntu-latest
-    if: github.actor == 'aarondfrancis'
+    if: github.repository == 'cfmpeg/cfmpeg-cli'
     outputs:
       version: ${{ steps.version.outputs.number }}
 
@@ -119,7 +119,7 @@ jobs:
 
   release-binaries:
     needs: release
-    if: github.actor == 'aarondfrancis'
+    if: github.repository == 'cfmpeg/cfmpeg-cli'
     uses: ./.github/workflows/release-binaries.yml
     with:
       tag: v${{ needs.release.outputs.version }}
@@ -127,7 +127,7 @@ jobs:
   publish-crate:
     needs: release
     runs-on: ubuntu-latest
-    if: github.actor == 'aarondfrancis'
+    if: github.repository == 'cfmpeg/cfmpeg-cli'
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -177,7 +177,7 @@ jobs:
       - release
       - release-binaries
     runs-on: ubuntu-latest
-    if: github.actor == 'aarondfrancis'
+    if: github.repository == 'cfmpeg/cfmpeg-cli'
 
     steps:
       - name: Update Homebrew formula
@@ -295,7 +295,7 @@ jobs:
       - release-binaries
       - update-homebrew
     runs-on: macos-latest
-    if: github.actor == 'aarondfrancis'
+    if: github.repository == 'cfmpeg/cfmpeg-cli'
     env:
       VERSION: ${{ needs.release.outputs.version }}
       REPOSITORY_OWNER: ${{ github.repository_owner }}

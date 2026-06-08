@@ -651,8 +651,8 @@ exit 0
         &[
             ("COMMITTER_TOKEN", "test-token"),
             ("VERSION", "1.2.3"),
-            ("REPOSITORY", "aarondfrancis/cfmpeg"),
-            ("REPOSITORY_OWNER", "aarondfrancis"),
+            ("REPOSITORY", "cfmpeg/cfmpeg-cli"),
+            ("REPOSITORY_OWNER", "cfmpeg"),
             ("HOMEBREW_TAP_OWNER", "cfmpeg"),
             ("HOMEBREW_TAP_REPO", "cfmpeg-homebrew-tap"),
             ("TEST_GIT_LOG", log_path.to_str().unwrap()),
@@ -668,7 +668,7 @@ exit 0
 
     assert!(formula.contains("version \"1.2.3\""));
     assert!(formula.contains(
-        "url \"https://github.com/aarondfrancis/cfmpeg/releases/download/v1.2.3/cfmpeg-darwin-arm64.tar.gz\""
+        "url \"https://github.com/cfmpeg/cfmpeg-cli/releases/download/v1.2.3/cfmpeg-darwin-arm64.tar.gz\""
     ));
     assert!(formula
         .contains("sha256 \"1111111111111111111111111111111111111111111111111111111111111111\""));
@@ -718,4 +718,17 @@ fn readme_uses_the_cfmpeg_homebrew_namespace() {
     ));
     assert!(readme.contains("brew install cfmpeg/cfmpeg-homebrew-tap/cfmpeg"));
     assert!(!readme.contains("brew install aarondfrancis/homebrew-tap/cfmpeg"));
+}
+
+#[test]
+fn public_metadata_uses_the_cfmpeg_cli_repository() {
+    let cargo_toml = repo_file("Cargo.toml");
+    let readme = repo_file("README.md");
+    let release_workflow = repo_file(".github/workflows/release.yml");
+
+    assert!(cargo_toml.contains(r#"repository = "https://github.com/cfmpeg/cfmpeg-cli""#));
+    assert!(!cargo_toml.contains("github.com/aarondfrancis"));
+    assert!(!readme.contains("https://cfmpeg.com/install.sh"));
+    assert!(!release_workflow.contains("github.actor == 'aarondfrancis'"));
+    assert!(release_workflow.contains("github.repository == 'cfmpeg/cfmpeg-cli'"));
 }

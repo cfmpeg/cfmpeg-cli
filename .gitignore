@@ -1,2 +1,6 @@
 /target
 .DS_Store
+
+# Local scratch artifacts
+run_output.txt
+src/repro_issue.rs

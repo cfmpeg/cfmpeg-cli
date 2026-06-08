@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Cloud ffmpeg — run ffmpeg commands on powerful remote containers"
 license = "MIT"
-repository = "https://github.com/aarondfrancis/cfmpeg"
+repository = "https://github.com/cfmpeg/cfmpeg-cli"
 homepage = "https://cfmpeg.com"
 keywords = ["ffmpeg", "video", "encoding", "cloud"]
 categories = ["command-line-utilities", "multimedia::video"]
@@ -15,8 +15,8 @@ reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-indicatif = "0.17"
-console = "0.15"
+indicatif = "0.18"
+console = "0.16"
 dirs = "5"
 thiserror = "2"
 futures = "0.3"
