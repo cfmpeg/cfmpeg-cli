@@ -63,6 +63,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Install ffmpeg build dependencies
+        if: matrix.asset_name == 'cfmpeg-linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+
       - name: Build bundled ffmpeg helpers
         run: bash scripts/build-helper-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-helper"
 

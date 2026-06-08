@@ -39,14 +39,21 @@ fi
 
 pushd "$SOURCE_DIR" >/dev/null
 
-./configure \
-  --prefix="$PREFIX" \
-  --disable-autodetect \
-  --disable-debug \
-  --disable-doc \
-  --disable-ffplay \
-  --disable-shared \
-  --enable-static
+CONFIGURE_FLAGS=(
+  "--prefix=$PREFIX"
+  "--disable-autodetect"
+  "--disable-debug"
+  "--disable-doc"
+  "--disable-ffplay"
+  "--disable-shared"
+  "--enable-static"
+)
+
+if ! command -v nasm >/dev/null 2>&1; then
+  CONFIGURE_FLAGS+=("--disable-x86asm")
+fi
+
+./configure "${CONFIGURE_FLAGS[@]}"
 
 make -j"$JOBS" ffmpeg ffprobe
 install -m 755 ffmpeg "$PREFIX/bin/ffmpeg"
