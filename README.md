@@ -101,7 +101,9 @@ export CFMPEG_API_KEY=cfm_xxxxxxxxxxxx
 
 ## Configuration
 
-Config lives at `~/.config/cfmpeg/config.toml`:
+Run `cfmpeg config path` to print the active config path for your platform.
+On macOS this is usually `~/Library/Application Support/cfmpeg/config.toml`;
+on Linux it is usually `~/.config/cfmpeg/config.toml`.
 
 ```toml
 api_key = "cfm_xxxxxxxxxxxx"

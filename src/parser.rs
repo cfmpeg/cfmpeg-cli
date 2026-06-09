@@ -231,6 +231,12 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
         ));
     }
 
+    if inputs.is_empty() {
+        return Err(CfmpegError::ParseError(
+            "no input file detected; include at least one `-i <input>`".to_string(),
+        ));
+    }
+
     Ok(ParsedCommand {
         inputs,
         outputs,
@@ -468,6 +474,15 @@ mod tests {
         let error = parse_ffmpeg_args(&args).expect_err("missing output");
 
         assert!(error.to_string().contains("no output file detected"));
+    }
+
+    #[test]
+    fn returns_error_when_input_is_missing() {
+        let args = vec!["output.mp4".to_string()];
+
+        let error = parse_ffmpeg_args(&args).expect_err("missing input");
+
+        assert!(error.to_string().contains("no input file detected"));
     }
 
     #[test]

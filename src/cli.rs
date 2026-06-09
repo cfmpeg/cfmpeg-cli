@@ -55,6 +55,10 @@ fn help_text() -> &'static str {
         "  - Use `--no-download` to leave completed outputs in cloud storage and print signed URLs instead.\n",
         "  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.\n",
         "  - Use `cfmpeg --help` or `cfmpeg help` for CLI help.\n",
+        "\n",
+        "Examples:\n",
+        "  cfmpeg --remote -f lavfi -i testsrc=size=128x128:rate=1 -t 1 -pix_fmt yuv420p /tmp/cfmpeg-smoke.mp4\n",
+        "  cfmpeg --remote -i https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4 -c:v libx264 -crf 30 -preset veryfast /tmp/cfmpeg-url-smoke.mp4\n",
     )
 }
 
@@ -379,6 +383,14 @@ mod tests {
     #[test]
     fn does_not_advertise_codecs_in_help() {
         assert!(!help_text().contains("--codecs"));
+    }
+
+    #[test]
+    fn advertises_smoke_test_examples_in_help() {
+        let help = help_text();
+
+        assert!(help.contains("testsrc=size=128x128:rate=1"));
+        assert!(help.contains("test-videos.co.uk"));
     }
 
     #[test]
