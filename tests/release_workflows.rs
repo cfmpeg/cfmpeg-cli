@@ -634,6 +634,10 @@ if [ "$1" = "diff" ] && [ "$2" = "--quiet" ]; then
   exit 1
 fi
 
+if [ "$1" = "diff" ] && [ "$2" = "--cached" ] && [ "$3" = "--quiet" ]; then
+  exit 1
+fi
+
 exit 0
 "#,
     );
@@ -682,8 +686,21 @@ exit 0
     assert!(git_log.contains(
         "clone https://x-access-token:test-token@github.com/cfmpeg/cfmpeg-homebrew-tap.git"
     ));
+    assert!(git_log.contains("add Formula/cfmpeg.rb"));
+    assert!(git_log.contains("diff --cached --quiet -- Formula/cfmpeg.rb"));
     assert!(git_log.contains("commit -m cfmpeg 1.2.3"));
     assert!(git_log.contains("push origin main"));
+
+    let add_index = git_log
+        .find("add Formula/cfmpeg.rb")
+        .expect("formula should be staged before diffing");
+    let diff_index = git_log
+        .find("diff --cached --quiet -- Formula/cfmpeg.rb")
+        .expect("staged formula should be checked for changes");
+    assert!(
+        add_index < diff_index,
+        "formula must be staged before the no-op diff so new formula files are committed"
+    );
 }
 
 #[test]
