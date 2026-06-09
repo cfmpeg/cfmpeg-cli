@@ -6,7 +6,9 @@ use crate::remote::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Auth(AuthAction),
-    Codecs,
+    Cancel {
+        job_id: String,
+    },
     Config(Option<ConfigAction>),
     Encode {
         ffmpeg_args: Vec<String>,
@@ -33,13 +35,41 @@ pub enum ConfigAction {
     Show,
 }
 
+fn help_text() -> &'static str {
+    concat!(
+        "cfmpeg\n",
+        "\n",
+        "Usage:\n",
+        "  cfmpeg [--local|--remote] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-timeout <duration>] <ffmpeg args...>\n",
+        "  cfmpeg auth <login|status|logout>\n",
+        "  cfmpeg cancel <job_id>\n",
+        "  cfmpeg config [path|show|edit]\n",
+        "  cfmpeg usage\n",
+        "  cfmpeg --version\n",
+        "  cfmpeg help\n",
+        "\n",
+        "Notes:\n",
+        "  - Arguments that look like ffmpeg flags are passed through directly.\n",
+        "  - Use `--local` to force local ffmpeg execution.\n",
+        "  - Use `--remote` to require cloud execution and disable local fallback for that run.\n",
+        "  - Use `--no-download` to leave completed outputs in cloud storage and print signed URLs instead.\n",
+        "  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.\n",
+        "  - Use `cfmpeg --help` or `cfmpeg help` for CLI help.\n",
+    )
+}
+
 pub fn parse_args(raw_args: Vec<String>) -> Result<Command> {
     if raw_args.is_empty() {
         return Ok(Command::Help);
     }
 
+    if matches!(raw_args.as_slice(), [arg] if arg == "--help" || arg == "-h") {
+        return Ok(Command::Help);
+    }
+
     match raw_args[0].as_str() {
         "auth" => parse_auth(&raw_args[1..]),
+        "cancel" => parse_cancel(&raw_args[1..]),
         "config" => parse_config(&raw_args[1..]),
         "help" => Ok(Command::Help),
         "usage" => parse_exact(raw_args, Command::Usage),
@@ -49,23 +79,7 @@ pub fn parse_args(raw_args: Vec<String>) -> Result<Command> {
 }
 
 pub fn print_help() {
-    println!("cfmpeg");
-    println!();
-    println!("Usage:");
-    println!("  cfmpeg [--local] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-timeout <duration>] <ffmpeg args...>");
-    println!("  cfmpeg auth <login|status|logout>");
-    println!("  cfmpeg config [path|show|edit]");
-    println!("  cfmpeg usage");
-    println!("  cfmpeg --codecs");
-    println!("  cfmpeg --version");
-    println!("  cfmpeg help");
-    println!();
-    println!("Notes:");
-    println!("  - Arguments that look like ffmpeg flags are passed through directly.");
-    println!("  - Use `--local` to force local ffmpeg execution.");
-    println!("  - Use `--no-download` to leave completed outputs in cloud storage and print signed URLs instead.");
-    println!("  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.");
-    println!("  - Use `cfmpeg help` for CLI help because `-h` is treated as an ffmpeg flag.");
+    print!("{}", help_text());
 }
 
 fn parse_auth(args: &[String]) -> Result<Command> {
@@ -81,6 +95,17 @@ fn parse_auth(args: &[String]) -> Result<Command> {
         },
         _ => Err(CfmpegError::ParseError(
             "auth accepts exactly one action".to_string(),
+        )),
+    }
+}
+
+fn parse_cancel(args: &[String]) -> Result<Command> {
+    match args {
+        [job_id] => Ok(Command::Cancel {
+            job_id: job_id.clone(),
+        }),
+        _ => Err(CfmpegError::ParseError(
+            "cancel accepts exactly one job id".to_string(),
         )),
     }
 }
@@ -115,7 +140,7 @@ fn parse_exact(raw_args: Vec<String>, command: Command) -> Result<Command> {
 fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     let mut force_local = false;
     let mut no_download = false;
-    let mut show_codecs = false;
+    let mut force_remote = false;
     let mut show_version = false;
     let mut ffmpeg_args = Vec::new();
     let mut remote = RemoteExecutionOptions::default();
@@ -125,8 +150,8 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         let arg = &raw_args[index];
         match arg.as_str() {
             "--local" => force_local = true,
+            "--remote" => force_remote = true,
             "--no-download" => no_download = true,
-            "--codecs" => show_codecs = true,
             "--version" => show_version = true,
             _ if arg.starts_with("--cf-profile=") => {
                 remote.profile = Some(parse_profile(value_after_equals(arg, "--cf-profile"))?);
@@ -189,18 +214,8 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         index += 1;
     }
 
-    if show_codecs {
-        if force_local || no_download || show_version || !ffmpeg_args.is_empty() {
-            return Err(CfmpegError::ParseError(
-                "--codecs must be used on its own".to_string(),
-            ));
-        }
-
-        return Ok(Command::Codecs);
-    }
-
     if show_version {
-        if force_local || no_download || !ffmpeg_args.is_empty() {
+        if force_local || force_remote || no_download || !ffmpeg_args.is_empty() {
             return Err(CfmpegError::ParseError(
                 "--version must be used on its own".to_string(),
             ));
@@ -213,10 +228,24 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         return Ok(Command::Help);
     }
 
+    if force_remote {
+        remote.strict_remote = true;
+    }
+
+    if force_local && remote.requires_strict_remote() {
+        return Err(CfmpegError::ParseError(
+            "--remote cannot be used together with --local".to_string(),
+        ));
+    }
+
     if force_local && !remote.is_empty() {
         return Err(CfmpegError::ParseError(
             "--cf-* flags cannot be used together with --local".to_string(),
         ));
+    }
+
+    if !remote.is_empty() {
+        remote.strict_remote = true;
     }
 
     Ok(Command::Encode {
@@ -241,7 +270,7 @@ fn value_after_flag<'a>(args: &'a [String], index: usize, flag: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, AuthAction, Command, ConfigAction};
+    use super::{help_text, parse_args, AuthAction, Command, ConfigAction};
     use crate::remote::{RemoteExecutionOptions, PROFILE_HIGHCPU};
 
     fn args(parts: &[&str]) -> Vec<String> {
@@ -290,6 +319,7 @@ mod tests {
                     cpu: Some(8),
                     memory_mb: Some(16 * 1024),
                     timeout_seconds: Some(90 * 60),
+                    strict_remote: true,
                 },
             }
         );
@@ -319,6 +349,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_common_help_flags_as_cli_help() {
+        assert_eq!(
+            parse_args(args(&["--help"])).expect("command"),
+            Command::Help
+        );
+        assert_eq!(parse_args(args(&["-h"])).expect("command"), Command::Help);
+    }
+
+    #[test]
+    fn parses_cancel_subcommand() {
+        let command = parse_args(args(&["cancel", "job_123"])).expect("command");
+
+        assert_eq!(
+            command,
+            Command::Cancel {
+                job_id: "job_123".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn parses_config_subcommand() {
         let command = parse_args(args(&["config", "show"])).expect("command");
 
@@ -326,10 +377,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mixed_codecs_and_ffmpeg_args() {
-        let error = parse_args(args(&["--codecs", "-i", "input.mov"])).expect_err("error");
+    fn does_not_advertise_codecs_in_help() {
+        assert!(!help_text().contains("--codecs"));
+    }
 
-        assert!(error.to_string().contains("--codecs"));
+    #[test]
+    fn treats_double_dash_codecs_as_ffmpeg_passthrough() {
+        let command = parse_args(args(&["--codecs", "output.txt"])).expect("command");
+
+        assert_eq!(
+            command,
+            Command::Encode {
+                ffmpeg_args: args(&["--codecs", "output.txt"]),
+                force_local: false,
+                no_download: false,
+                remote: RemoteExecutionOptions::default(),
+            }
+        );
     }
 
     #[test]
@@ -345,6 +409,39 @@ mod tests {
         .expect_err("error");
 
         assert!(error.to_string().contains("--cf-*"));
+    }
+
+    #[test]
+    fn parses_remote_flag_as_strict_remote_without_execution_options() {
+        let command =
+            parse_args(args(&["--remote", "-i", "input.mov", "output.mp4"])).expect("command");
+
+        assert_eq!(
+            command,
+            Command::Encode {
+                ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
+                force_local: false,
+                no_download: false,
+                remote: RemoteExecutionOptions {
+                    strict_remote: true,
+                    ..RemoteExecutionOptions::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_remote_flag_with_local_mode() {
+        let error = parse_args(args(&[
+            "--local",
+            "--remote",
+            "-i",
+            "input.mov",
+            "output.mp4",
+        ]))
+        .expect_err("error");
+
+        assert!(error.to_string().contains("--remote"));
     }
 
     #[test]

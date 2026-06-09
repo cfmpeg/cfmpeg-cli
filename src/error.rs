@@ -17,7 +17,7 @@ pub enum CfmpegError {
     #[error("download failed for {filename}: {reason}")]
     Download { filename: String, reason: String },
     #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("input not found: {0}")]
     InputNotFound(String),
     #[error("i/o error: {0}")]
@@ -34,4 +34,27 @@ pub enum CfmpegError {
     Protocol(String),
     #[error("upload failed for {filename}: {reason}")]
     Upload { filename: String, reason: String },
+}
+
+impl From<reqwest::Error> for CfmpegError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(describe_http_error(&error))
+    }
+}
+
+pub fn describe_http_error(error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+
+    while let Some(error) = source {
+        let message = error.to_string();
+
+        if parts.last() != Some(&message) {
+            parts.push(message);
+        }
+
+        source = std::error::Error::source(error);
+    }
+
+    parts.join("; caused by: ")
 }

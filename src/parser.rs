@@ -21,38 +21,55 @@ pub struct ParsedCommand {
     pub sandbox_args: Vec<String>,
 }
 
-const VALUED_OPTIONS: &[&str] = &[
+// ffmpeg allows many options to carry per-stream suffixes like `:v:0`.
+// Matching option families keeps the parser table smaller and avoids
+// duplicating every stream-specific spelling by hand.
+const VALUED_OPTION_FAMILIES: &[&str] = &[
+    "-ab",
     "-ac",
+    "-acodec",
+    "-af",
+    "-aframes",
     "-ar",
     "-aspect",
+    "-aq",
+    "-atag",
     "-b",
-    "-b:a",
-    "-b:v",
+    "-bsf",
     "-bufsize",
     "-c",
-    "-c:a",
-    "-c:s",
-    "-c:v",
+    "-canvas_size",
+    "-ch_layout",
+    "-channel_layout",
     "-codec",
     "-color_primaries",
     "-colorspace",
     "-color_trc",
     "-crf",
+    "-dcodec",
+    "-disposition",
     "-f",
     "-fflags",
-    "-filter:a",
-    "-filter:v",
+    "-filter",
     "-filter_complex",
+    "-filter_complex_script",
+    "-filter_script",
     "-filter_threads",
     "-framerate",
     "-frames",
-    "-frames:a",
-    "-frames:v",
+    "-fs",
     "-g",
+    "-guess_layout_max",
     "-hls_list_size",
     "-hls_segment_filename",
     "-hls_time",
+    "-hwaccel",
+    "-hwaccel_device",
+    "-hwaccel_output_format",
+    "-itsscale",
+    "-itsoffset",
     "-keyint_min",
+    "-lavfi",
     "-level",
     "-loglevel",
     "-map",
@@ -63,32 +80,49 @@ const VALUED_OPTIONS: &[&str] = &[
     "-metadata",
     "-minrate",
     "-movflags",
+    "-muxdelay",
+    "-muxpreload",
+    "-pass",
+    "-passlogfile",
     "-pix_fmt",
     "-preset",
+    "-pre",
     "-profile",
-    "-profile:v",
+    "-q",
+    "-qscale",
     "-qp",
     "-r",
     "-rc-lookahead",
+    "-readrate",
+    "-readrate_catchup",
+    "-readrate_initial_burst",
     "-s",
     "-sample_fmt",
     "-sc_threshold",
+    "-scodec",
     "-segment_list",
     "-segment_time",
     "-spatial-aq",
+    "-spre",
     "-ss",
     "-sseof",
     "-start_number",
     "-stats_period",
+    "-stream_loop",
     "-t",
     "-tag",
-    "-tag:a",
-    "-tag:v",
     "-temporal-aq",
     "-threads",
+    "-thread_queue_size",
+    "-timecode",
+    "-timestamp",
     "-to",
     "-tune",
+    "-vcodec",
     "-vf",
+    "-vframes",
+    "-vpre",
+    "-vtag",
     "-video_size",
     "-vsync",
 ];
@@ -145,6 +179,12 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
 
         if is_valued_option(arg) {
             sandbox_args.push(arg.clone());
+
+            if has_inline_option_value(arg) {
+                index += 1;
+                continue;
+            }
+
             index += 1;
 
             let value = args
@@ -164,12 +204,10 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
         if arg.starts_with('-') && arg.len() > 1 {
             sandbox_args.push(arg.clone());
 
-            if let Some(next_arg) = args.get(index + 1) {
-                if !next_arg.starts_with('-') && index + 1 < args.len() - 1 {
-                    sandbox_args.push(next_arg.clone());
-                    index += 2;
-                    continue;
-                }
+            if should_consume_unknown_option_value(args, index) {
+                sandbox_args.push(args[index + 1].clone());
+                index += 2;
+                continue;
             }
 
             index += 1;
@@ -302,11 +340,62 @@ fn build_remote_output_name(output_path: &Path, output_counter: usize) -> String
 }
 
 fn is_valued_option(arg: &str) -> bool {
-    VALUED_OPTIONS.contains(&arg)
+    VALUED_OPTION_FAMILIES
+        .iter()
+        .any(|family| matches_option_family(arg, family))
 }
 
 fn is_flag_option(arg: &str) -> bool {
-    FLAG_OPTIONS.contains(&arg)
+    FLAG_OPTIONS.contains(&option_name(arg))
+}
+
+fn matches_option_family(arg: &str, family: &str) -> bool {
+    let option = option_name(arg);
+    option == family
+        || option
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn option_name(arg: &str) -> &str {
+    arg.split_once('=').map(|(option, _)| option).unwrap_or(arg)
+}
+
+fn has_inline_option_value(arg: &str) -> bool {
+    arg.split_once('=')
+        .is_some_and(|(option, _)| option.starts_with('-'))
+}
+
+fn should_consume_unknown_option_value(args: &[String], index: usize) -> bool {
+    let Some(next_arg) = args.get(index + 1) else {
+        return false;
+    };
+
+    if has_inline_option_value(&args[index])
+        || next_arg.starts_with('-')
+        || index + 1 >= args.len() - 1
+    {
+        return false;
+    }
+
+    !starts_multi_positional_run(args, index + 1)
+}
+
+fn starts_multi_positional_run(args: &[String], start: usize) -> bool {
+    let mut count = 0usize;
+
+    for arg in &args[start..] {
+        if arg.starts_with('-') {
+            break;
+        }
+
+        count += 1;
+        if count > 1 {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -413,5 +502,117 @@ mod tests {
         assert_eq!(parsed.sandbox_args[1], "https://example.com/input.mov");
         assert_eq!(parsed.sandbox_args[2], "/tmp/cfmpeg/outputs/output_0.mp4");
         assert_eq!(parsed.sandbox_args[3], "/tmp/cfmpeg/outputs/output_1.mp4");
+    }
+
+    #[test]
+    fn reports_missing_output_for_stream_specifier_valued_option() {
+        let args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mov".to_string(),
+            "-disposition:s:0".to_string(),
+            "default".to_string(),
+        ];
+
+        let error = parse_ffmpeg_args(&args).expect_err("missing output");
+
+        assert!(error.to_string().contains("no output file detected"));
+    }
+
+    #[test]
+    fn reports_missing_output_for_common_valued_option_family() {
+        let args = vec![
+            "-stream_loop".to_string(),
+            "2".to_string(),
+            "-i".to_string(),
+            "https://example.com/input.mov".to_string(),
+        ];
+
+        let error = parse_ffmpeg_args(&args).expect_err("missing output");
+
+        assert!(error.to_string().contains("no output file detected"));
+    }
+
+    #[test]
+    fn matches_stream_specifier_option_families_without_duplicate_entries() {
+        let args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mov".to_string(),
+            "-c:v:0".to_string(),
+            "libx264".to_string(),
+            "-metadata:s:v:0".to_string(),
+            "title=Main".to_string(),
+            "output.mp4".to_string(),
+        ];
+
+        let parsed = parse_ffmpeg_args(&args).expect("parsed command");
+
+        assert_eq!(
+            parsed.sandbox_args,
+            vec![
+                "-i",
+                "https://example.com/input.mov",
+                "-c:v:0",
+                "libx264",
+                "-metadata:s:v:0",
+                "title=Main",
+                "/tmp/cfmpeg/outputs/output_0.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_output_when_known_option_uses_inline_value_syntax() {
+        let args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mov".to_string(),
+            "-c:v=libx264".to_string(),
+            "output.mp4".to_string(),
+        ];
+
+        let parsed = parse_ffmpeg_args(&args).expect("parsed command");
+
+        assert_eq!(parsed.outputs.len(), 1);
+        assert_eq!(parsed.outputs[0].path, PathBuf::from("output.mp4"));
+        assert_eq!(
+            parsed.sandbox_args,
+            vec![
+                "-i",
+                "https://example.com/input.mov",
+                "-c:v=libx264",
+                "/tmp/cfmpeg/outputs/output_0.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_consume_first_output_as_unknown_option_value() {
+        let args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mov".to_string(),
+            "-copyts".to_string(),
+            "first.mp4".to_string(),
+            "second.mp4".to_string(),
+        ];
+
+        let parsed = parse_ffmpeg_args(&args).expect("parsed command");
+
+        assert_eq!(
+            parsed
+                .outputs
+                .iter()
+                .map(|output| output.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("first.mp4"), PathBuf::from("second.mp4")]
+        );
+        assert_eq!(
+            parsed.sandbox_args,
+            vec![
+                "-i",
+                "https://example.com/input.mov",
+                "-copyts",
+                "/tmp/cfmpeg/outputs/output_0.mp4",
+                "/tmp/cfmpeg/outputs/output_1.mp4",
+            ]
+        );
     }
 }

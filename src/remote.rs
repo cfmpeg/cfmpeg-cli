@@ -14,6 +14,8 @@ pub struct RemoteExecutionOptions {
     pub memory_mb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u32>,
+    #[serde(skip)]
+    pub strict_remote: bool,
 }
 
 impl RemoteExecutionOptions {
@@ -30,11 +32,12 @@ impl RemoteExecutionOptions {
             cpu: self.cpu.or(defaults.cpu),
             memory_mb: self.memory_mb.or(defaults.memory_mb),
             timeout_seconds: self.timeout_seconds.or(defaults.timeout_seconds),
+            strict_remote: self.strict_remote,
         }
     }
 
     pub fn requires_strict_remote(&self) -> bool {
-        false
+        self.strict_remote
     }
 }
 
@@ -164,5 +167,34 @@ mod tests {
             ..RemoteExecutionOptions::default()
         }
         .is_empty());
+    }
+
+    #[test]
+    fn explicit_remote_requests_require_remote_execution() {
+        assert!(RemoteExecutionOptions {
+            cpu: Some(8),
+            strict_remote: true,
+            ..RemoteExecutionOptions::default()
+        }
+        .requires_strict_remote());
+    }
+
+    #[test]
+    fn strict_remote_without_resource_overrides_still_requires_remote_execution() {
+        assert!(RemoteExecutionOptions {
+            strict_remote: true,
+            ..RemoteExecutionOptions::default()
+        }
+        .requires_strict_remote());
+    }
+
+    #[test]
+    fn default_remote_preferences_do_not_require_remote_execution() {
+        let merged = RemoteExecutionOptions::default().merge_defaults(&RemoteExecutionOptions {
+            timeout_seconds: Some(3600),
+            ..RemoteExecutionOptions::default()
+        });
+
+        assert!(!merged.requires_strict_remote());
     }
 }

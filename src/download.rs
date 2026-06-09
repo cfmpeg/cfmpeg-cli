@@ -1,4 +1,4 @@
-use crate::api::{ApiClient, OutputFile};
+use crate::api::{ApiClient, OutputBatch, OutputFile};
 use crate::error::{CfmpegError, Result};
 use crate::media_tools::ffmpeg_binary;
 use crate::parser::Output;
@@ -83,31 +83,14 @@ pub async fn download_progressive_batches(
     loop {
         let response = api.get_output_batches(job_id).await?;
 
-        if response.delivery_mode != "progressive_batches" {
+        if !response.is_progressive_batches() {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             return Err(CfmpegError::Protocol(
                 "job does not expose progressive batch outputs".to_string(),
             ));
         }
 
-        for batch in response.batches {
-            if downloaded.contains_key(&batch.index) {
-                continue;
-            }
-
-            let batch_path = temp_dir.join(format!("batch_{:05}.mp4", batch.index));
-            download_file(
-                client,
-                &OutputFile {
-                    filename: batch.filename,
-                    download_url: batch.download_url,
-                    size_bytes: batch.size_bytes,
-                },
-                &batch_path,
-            )
-            .await?;
-            downloaded.insert(batch.index, batch_path);
-        }
+        download_missing_batches(client, &temp_dir, &mut downloaded, response.batches).await?;
 
         if stop.load(Ordering::Relaxed) || response.complete {
             break;
@@ -116,25 +99,16 @@ pub async fn download_progressive_batches(
         tokio::time::sleep(PROGRESSIVE_BATCH_POLL_INTERVAL).await;
     }
 
-    let response = api.get_output_batches(job_id).await?;
-    for batch in response.batches {
-        if downloaded.contains_key(&batch.index) {
-            continue;
-        }
+    let response = api.get_outputs(job_id).await?;
 
-        let batch_path = temp_dir.join(format!("batch_{:05}.mp4", batch.index));
-        download_file(
-            client,
-            &OutputFile {
-                filename: batch.filename,
-                download_url: batch.download_url,
-                size_bytes: batch.size_bytes,
-            },
-            &batch_path,
-        )
-        .await?;
-        downloaded.insert(batch.index, batch_path);
+    if !response.is_progressive_batches() {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        return Err(CfmpegError::Protocol(
+            "job does not expose progressive batch outputs".to_string(),
+        ));
     }
+
+    download_missing_batches(client, &temp_dir, &mut downloaded, response.batches).await?;
 
     let mut ordered_batches: Vec<(u32, PathBuf)> = downloaded.into_iter().collect();
     ordered_batches.sort_by_key(|(index, _)| *index);
@@ -156,6 +130,34 @@ pub async fn download_progressive_batches(
     .await?;
 
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+
+    Ok(())
+}
+
+async fn download_missing_batches(
+    client: &Client,
+    temp_dir: &Path,
+    downloaded: &mut HashMap<u32, PathBuf>,
+    batches: Vec<OutputBatch>,
+) -> Result<()> {
+    for batch in batches {
+        if downloaded.contains_key(&batch.index) {
+            continue;
+        }
+
+        let batch_path = temp_dir.join(format!("batch_{:05}.mp4", batch.index));
+        download_file(
+            client,
+            &OutputFile {
+                filename: batch.filename,
+                download_url: batch.download_url,
+                size_bytes: batch.size_bytes,
+            },
+            &batch_path,
+        )
+        .await?;
+        downloaded.insert(batch.index, batch_path);
+    }
 
     Ok(())
 }

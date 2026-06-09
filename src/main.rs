@@ -14,7 +14,7 @@ mod upload;
 
 use crate::api::{
     ApiClient, CompleteIngestRequest, CompletedMultipartUpload, CreateJobRequest, JobInput,
-    OutputDeliveryRequest, StartJobRequest,
+    OutputDeliveryRequest, StartJobRequest, UsageResponse,
 };
 use crate::cli::{AuthAction, Command, ConfigAction};
 use crate::config::Config;
@@ -53,7 +53,7 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        Command::Codecs => show_remote_codecs().await,
+        Command::Cancel { job_id } => cancel_job(&job_id).await,
         Command::Config(action) => handle_config_command(action),
         Command::Encode {
             ffmpeg_args,
@@ -68,6 +68,16 @@ async fn run() -> Result<()> {
         Command::Usage => show_usage().await,
         Command::Version => show_version().await,
     }
+}
+
+async fn cancel_job(job_id: &str) -> Result<()> {
+    let config = Config::load()?;
+    let api = ApiClient::from_config(&config)?;
+    let status = api.cancel_job(job_id).await?;
+
+    println!("{} {}", style("cancelled").yellow().bold(), status.job_id);
+
+    Ok(())
 }
 
 fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
@@ -134,7 +144,7 @@ async fn run_encode(
     let parsed = parser::parse_ffmpeg_args(ffmpeg_args)?;
     let api = match ApiClient::from_config(&config) {
         Ok(api) => api,
-        Err(CfmpegError::NotAuthenticated) if config.local_fallback => {
+        Err(CfmpegError::NotAuthenticated) if allows_local_fallback(&config, &effective_remote) => {
             eprintln!("  warning: not authenticated; falling back to local ffmpeg.");
             eprintln!("  run `cfmpeg auth login` to use cloud execution.");
             eprintln!();
@@ -143,9 +153,9 @@ async fn run_encode(
         Err(error) => return Err(error),
     };
 
-    if !api.health_check().await {
-        if config.local_fallback && !effective_remote.requires_strict_remote() {
-            eprintln!("  warning: api unreachable; falling back to local ffmpeg.");
+    if let Err(error) = api.health_check().await {
+        if allows_local_fallback(&config, &effective_remote) {
+            eprintln!("  warning: {error}; falling back to local ffmpeg.");
             if !effective_remote.is_empty() {
                 eprintln!(
                     "  note: ignoring requested remote execution settings during local fallback."
@@ -155,8 +165,12 @@ async fn run_encode(
             return fallback::run_local(ffmpeg_args).await;
         }
 
-        return Err(CfmpegError::ApiUnreachable(config.api_base()));
+        return Err(error);
     }
+    eprintln!(
+        "  {} api reachable; using remote execution",
+        style("->").cyan()
+    );
 
     let http_client = Client::builder()
         .user_agent(format!("cfmpeg/{}", env!("CARGO_PKG_VERSION")))
@@ -223,6 +237,7 @@ async fn run_encode(
     };
 
     eprintln!("  {} job {}", style("->").cyan(), style(&job.job_id).dim());
+    eprintln!("  {} starting remote execution", style("->").cyan());
 
     let local_inputs: Vec<_> = parsed
         .inputs
@@ -336,7 +351,7 @@ async fn run_encode(
                 })??;
 
                 eprintln!();
-                eprintln!("  {} complete.", style("ok").green().bold());
+                print_local_completion(&parsed.outputs);
                 return Ok(());
             }
             (Err(error), Some(handle)) => {
@@ -414,23 +429,12 @@ async fn run_encode(
         eprintln!("  {} complete.", style("ok").green().bold());
     } else {
         eprintln!();
+        eprintln!("  {} downloading outputs", style("->").cyan());
         download::download_outputs(&http_client, &outputs.outputs, &parsed.outputs).await?;
         eprintln!();
-        eprintln!("  {} complete.", style("ok").green().bold());
+        print_local_completion(&parsed.outputs);
     }
 
-    Ok(())
-}
-
-async fn show_remote_codecs() -> Result<()> {
-    let config = Config::load()?;
-    let api = ApiClient::from_config(&config)?;
-
-    if !api.health_check().await {
-        return Err(CfmpegError::ApiUnreachable(config.api_base()));
-    }
-
-    println!("Remote ffmpeg codec listing is not implemented yet.");
     Ok(())
 }
 
@@ -439,20 +443,66 @@ async fn show_usage() -> Result<()> {
     let api = ApiClient::from_config(&config)?;
     let usage = api.get_usage().await?;
 
-    println!("Current billing period");
-    println!("  {} to {}", usage.period_start, usage.period_end);
-    println!("  CPU encoding: {:.1} minutes", usage.cpu_minutes);
-    println!("  Total jobs:   {}", usage.jobs_count);
-    println!(
-        "  Balance:      {}",
-        format_money_from_millicents(usage.balance_millicents, &usage.currency)
-    );
-    println!(
-        "  Total cost:   ${:.2}",
-        usage.total_cost_cents as f64 / 100.0
-    );
+    for line in format_usage_report(&usage) {
+        println!("{line}");
+    }
 
     Ok(())
+}
+
+fn format_usage_report(usage: &UsageResponse) -> Vec<String> {
+    vec![
+        "Current billing period".to_string(),
+        format!("  {} to {}", usage.period_start, usage.period_end),
+        format!("  CPU encoding: {:.1} minutes", usage.cpu_minutes),
+        format!("  Total jobs:   {}", usage.jobs_count),
+        format!(
+            "  Balance:      {}",
+            format_money_from_millicents(usage.balance_millicents, &usage.currency)
+        ),
+        format!(
+            "  Total cost:   {}",
+            format_money_from_millicents(usage.total_cost_millicents(), &usage.currency)
+        ),
+    ]
+}
+
+fn print_local_completion(outputs: &[parser::Output]) {
+    eprintln!("  {} complete.", style("ok").green().bold());
+
+    for line in local_output_summary_lines(outputs) {
+        eprintln!("  {} {line}", style("->").cyan());
+    }
+}
+
+fn local_output_summary_lines(outputs: &[parser::Output]) -> Vec<String> {
+    outputs
+        .iter()
+        .map(|output| {
+            let size = std::fs::metadata(&output.path)
+                .ok()
+                .map(|metadata| format!(" ({})", format_file_size(metadata.len())))
+                .unwrap_or_default();
+
+            format!("{}{}", output.path.display(), size)
+        })
+        .collect()
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format!("{} KiB", bytes.div_ceil(KIB))
+    } else if bytes < GIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    }
 }
 
 async fn show_version() -> Result<()> {
@@ -471,10 +521,7 @@ async fn maybe_fallback_to_local(
     effective_remote: &remote::RemoteExecutionOptions,
     error: &CfmpegError,
 ) -> Option<Result<()>> {
-    if !config.local_fallback
-        || effective_remote.requires_strict_remote()
-        || !should_fallback_to_local(error)
-    {
+    if !allows_local_fallback(config, effective_remote) || !should_fallback_to_local(error) {
         return None;
     }
 
@@ -497,6 +544,13 @@ async fn maybe_fallback_to_local(
     eprintln!();
 
     Some(fallback::run_local(ffmpeg_args).await)
+}
+
+fn allows_local_fallback(
+    config: &Config,
+    effective_remote: &remote::RemoteExecutionOptions,
+) -> bool {
+    config.local_fallback && !effective_remote.requires_strict_remote()
 }
 
 fn should_fallback_to_local(error: &CfmpegError) -> bool {
@@ -557,8 +611,16 @@ struct DisplayConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_money_from_millicents, should_fallback_to_local};
+    use super::{
+        allows_local_fallback, format_file_size, format_money_from_millicents, format_usage_report,
+        local_output_summary_lines, should_fallback_to_local,
+    };
+    use crate::api::UsageResponse;
+    use crate::config::Config;
     use crate::error::CfmpegError;
+    use crate::parser::Output;
+    use crate::remote::RemoteExecutionOptions;
+    use std::path::PathBuf;
 
     #[test]
     fn falls_back_for_insufficient_funds_errors() {
@@ -573,5 +635,79 @@ mod tests {
     fn formats_millicent_balances() {
         assert_eq!(format_money_from_millicents(9_833, "usd"), "$0.09833");
         assert_eq!(format_money_from_millicents(-167, "usd"), "-$0.00167");
+    }
+
+    #[test]
+    fn formats_usage_total_cost_from_millicents() {
+        let usage = UsageResponse {
+            period_start: "2026-06-01".to_string(),
+            period_end: "2026-06-30".to_string(),
+            cpu_minutes: 0.5,
+            gpu_minutes: 0.0,
+            total_cost_cents: 0,
+            total_cost_millicents: 369,
+            jobs_count: 3,
+            balance_millicents: 4_698_347,
+            currency: "usd".to_string(),
+        };
+
+        let report = format_usage_report(&usage);
+
+        assert!(report.contains(&"  Total cost:   $0.00369".to_string()));
+        assert!(report.contains(&"  Balance:      $46.98347".to_string()));
+    }
+
+    #[test]
+    fn formats_local_output_summary_with_file_size() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let output_path = temp_dir.path().join("output.mp4");
+        std::fs::write(&output_path, vec![0u8; 207_820]).expect("write output");
+
+        let lines = local_output_summary_lines(&[Output {
+            path: output_path.clone(),
+            remote_name: "output.mp4".to_string(),
+        }]);
+
+        assert_eq!(lines, vec![format!("{} (203 KiB)", output_path.display())]);
+    }
+
+    #[test]
+    fn formats_local_output_summary_without_size_when_missing() {
+        let lines = local_output_summary_lines(&[Output {
+            path: PathBuf::from("/tmp/missing-cfmpeg-output.mp4"),
+            remote_name: "output.mp4".to_string(),
+        }]);
+
+        assert_eq!(lines, vec!["/tmp/missing-cfmpeg-output.mp4".to_string()]);
+    }
+
+    #[test]
+    fn formats_file_sizes_for_completion_output() {
+        assert_eq!(format_file_size(512), "512 B");
+        assert_eq!(format_file_size(1_025), "2 KiB");
+        assert_eq!(format_file_size(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn allows_local_fallback_for_remote_defaults() {
+        let config = Config::default();
+        let remote = RemoteExecutionOptions {
+            profile: Some("balanced".to_string()),
+            ..RemoteExecutionOptions::default()
+        };
+
+        assert!(allows_local_fallback(&config, &remote));
+    }
+
+    #[test]
+    fn strict_remote_requests_disable_local_fallback() {
+        let config = Config::default();
+        let remote = RemoteExecutionOptions {
+            cpu: Some(8),
+            strict_remote: true,
+            ..RemoteExecutionOptions::default()
+        };
+
+        assert!(!allows_local_fallback(&config, &remote));
     }
 }

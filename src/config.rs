@@ -114,18 +114,17 @@ impl Config {
     }
 
     pub fn remote_execution_defaults(&self) -> Result<RemoteExecutionOptions> {
+        let profile = match option_from_env("CFMPEG_REMOTE_PROFILE") {
+            Some(value) => Some(parse_profile(&value)?),
+            None => self
+                .remote_profile
+                .as_deref()
+                .map(parse_profile)
+                .transpose()?,
+        };
+
         Ok(RemoteExecutionOptions {
-            profile: option_from_env("CFMPEG_REMOTE_PROFILE")
-                .map(|value| normalize_profile(&value))
-                .transpose()?
-                .or_else(|| {
-                    self.remote_profile
-                        .as_deref()
-                        .map(normalize_profile)
-                        .transpose()
-                        .ok()
-                        .flatten()
-                }),
+            profile,
             cpu: option_from_env("CFMPEG_REMOTE_CPU")
                 .map(|value| parse_cpu_cores(&value))
                 .transpose()?
@@ -138,6 +137,7 @@ impl Config {
                 .map(|value| parse_timeout_seconds(&value))
                 .transpose()?
                 .or(self.remote_timeout_seconds),
+            strict_remote: false,
         })
     }
 
@@ -184,14 +184,6 @@ fn option_from_env(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn normalize_profile(value: &str) -> Result<String> {
-    if value.trim() == "gpu" {
-        return Ok("highcpu".to_string());
-    }
-
-    parse_profile(value)
 }
 
 #[cfg(test)]
@@ -284,16 +276,18 @@ mod tests {
     }
 
     #[test]
-    fn remote_execution_defaults_downgrade_legacy_gpu_profile() {
+    fn remote_execution_defaults_rejects_legacy_gpu_profile() {
         let config = Config {
             remote_profile: Some("gpu".to_string()),
             ..Config::default()
         };
 
-        let remote = config
+        let error = config
             .remote_execution_defaults()
-            .expect("remote execution defaults");
+            .expect_err("gpu profile should be rejected");
 
-        assert_eq!(remote.profile.as_deref(), Some("highcpu"));
+        assert!(error
+            .to_string()
+            .contains("GPU execution is not currently available"));
     }
 }

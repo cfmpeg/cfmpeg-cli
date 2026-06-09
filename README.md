@@ -34,11 +34,17 @@ If you install from source instead, keep `ffmpeg` available on `PATH` or point c
 # Authenticate (one time)
 cfmpeg auth login
 
+# See cfmpeg-specific commands and flags
+cfmpeg --help
+
 # Use it exactly like ffmpeg
 cfmpeg -i input.mov -c:v libx265 -crf 28 output.mp4
 
 # Request larger remote hardware without changing ffmpeg args
 cfmpeg --cf-profile highcpu -i input.mov -c:v libx264 output.mp4
+
+# Require cloud execution for this run and disable local fallback
+cfmpeg --remote -i input.mov -c:v libx264 output.mp4
 ```
 
 `cfmpeg auth login` opens the API key page and then prompts you to paste the key back into the CLI for local storage.
@@ -53,7 +59,21 @@ cfmpeg --cf-profile highcpu -i input.mov -c:v libx264 output.mp4
 URL inputs skip the upload entirely — the container fetches directly:
 
 ```bash
-cfmpeg -i https://example.com/raw.mov -c:v libx264 output.mp4
+cfmpeg --remote -i https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4 -c:v libx264 -crf 30 -preset veryfast output.mp4
+```
+
+## Smoke Tests
+
+Use a synthetic input when you want to verify remote execution without preparing a media file:
+
+```bash
+cfmpeg --remote -f lavfi -i testsrc=size=128x128:rate=1 -t 1 -pix_fmt yuv420p /tmp/cfmpeg-smoke.mp4
+```
+
+Use a small public URL to verify URL passthrough:
+
+```bash
+cfmpeg --remote -i https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4 -c:v libx264 -crf 30 -preset veryfast /tmp/cfmpeg-url-smoke.mp4
 ```
 
 ## Features
@@ -124,6 +144,7 @@ cfmpeg --local -i input.mov output.mp4
 ```
 
 If the API is unreachable and `local_fallback = true` (default), cfmpeg automatically falls back to local ffmpeg with a warning.
+Use `--remote` or any `--cf-*` resource flag to require cloud execution and fail instead of falling back locally.
 
 ## Development
 

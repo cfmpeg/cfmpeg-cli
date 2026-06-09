@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::error::{CfmpegError, Result};
+use crate::error::{describe_http_error, CfmpegError, Result};
 use crate::remote::RemoteExecutionOptions;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
@@ -251,8 +251,9 @@ pub enum JobState {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_error_response, ApiClient, CompletedMultipartPart, CreateJobResponse, JobState,
-        JobStatus, ProgressEvent, StartJobRequest, UploadTarget,
+        parse_error_response, ApiClient, CompletedMultipartPart, CreateJobResponse,
+        JobOutputResponse, JobState, JobStatus, ProgressEvent, StartJobRequest, UploadTarget,
+        UsageResponse,
     };
 
     #[test]
@@ -492,6 +493,73 @@ mod tests {
             Some("ffmpeg failed: no such filter")
         );
     }
+
+    #[test]
+    fn deserializes_final_output_payload_with_shared_contract() {
+        let response: JobOutputResponse = serde_json::from_str(
+            r#"{
+                "delivery_mode": "final_artifact",
+                "complete": true,
+                "outputs": [{
+                    "filename": "output.mp4",
+                    "download_url": "https://example.com/output.mp4",
+                    "size_bytes": 42
+                }],
+                "batches": []
+            }"#,
+        )
+        .expect("final output response should deserialize");
+
+        assert!(!response.is_progressive_batches());
+        assert!(response.complete);
+        assert_eq!(response.outputs.len(), 1);
+        assert!(response.batches.is_empty());
+    }
+
+    #[test]
+    fn deserializes_progressive_output_payload_with_shared_contract() {
+        let response: JobOutputResponse = serde_json::from_str(
+            r#"{
+                "delivery_mode": "progressive_batches",
+                "complete": false,
+                "outputs": [],
+                "batches": [{
+                    "index": 0,
+                    "filename": "output_0.batch_00000.mp4",
+                    "download_url": "https://example.com/output_0.batch_00000.mp4",
+                    "size_bytes": 128
+                }]
+            }"#,
+        )
+        .expect("progressive output response should deserialize");
+
+        assert!(response.is_progressive_batches());
+        assert!(!response.complete);
+        assert!(response.outputs.is_empty());
+        assert_eq!(response.batches.len(), 1);
+        assert_eq!(response.batches[0].index, 0);
+    }
+
+    #[test]
+    fn deserializes_usage_millicent_costs() {
+        let response: UsageResponse = serde_json::from_str(
+            r#"{
+                "period_start": "2026-06-01",
+                "period_end": "2026-06-30",
+                "cpu_minutes": 0.5,
+                "gpu_minutes": 0,
+                "total_cost_cents": 0,
+                "total_cost_millicents": 369,
+                "jobs_count": 3,
+                "balance_cents": 4698,
+                "balance_millicents": 4698347,
+                "currency": "usd"
+            }"#,
+        )
+        .expect("usage response should deserialize");
+
+        assert_eq!(response.total_cost_millicents(), 369);
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -516,20 +584,20 @@ pub struct JobProgress {
 
 #[derive(Debug, Deserialize)]
 pub struct JobOutputResponse {
-    #[allow(dead_code)]
-    #[serde(default = "default_output_delivery_mode")]
-    pub delivery_mode: String,
-    pub outputs: Vec<OutputFile>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct JobOutputBatchesResponse {
     #[serde(default = "default_output_delivery_mode")]
     pub delivery_mode: String,
     #[serde(default)]
     pub complete: bool,
     #[serde(default)]
+    pub outputs: Vec<OutputFile>,
+    #[serde(default)]
     pub batches: Vec<OutputBatch>,
+}
+
+impl JobOutputResponse {
+    pub fn is_progressive_batches(&self) -> bool {
+        self.delivery_mode == "progressive_batches"
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -554,12 +622,25 @@ pub struct UsageResponse {
     pub cpu_minutes: f64,
     #[allow(dead_code)]
     pub gpu_minutes: f64,
+    #[allow(dead_code)]
     pub total_cost_cents: u64,
+    #[serde(default)]
+    pub total_cost_millicents: i64,
     pub jobs_count: u64,
     #[serde(default)]
     pub balance_millicents: i64,
     #[serde(default = "default_currency")]
     pub currency: String,
+}
+
+impl UsageResponse {
+    pub fn total_cost_millicents(&self) -> i64 {
+        if self.total_cost_millicents != 0 {
+            self.total_cost_millicents
+        } else {
+            (self.total_cost_cents as i64) * 1_000
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -646,9 +727,13 @@ impl ApiClient {
             .await
             .map_err(|error| {
                 if error.is_connect() || error.is_timeout() {
-                    CfmpegError::ApiUnreachable(self.base_url.clone())
+                    CfmpegError::ApiUnreachable(format!(
+                        "{} ({})",
+                        self.base_url,
+                        describe_http_error(&error)
+                    ))
                 } else {
-                    CfmpegError::Http(error)
+                    CfmpegError::from(error)
                 }
             })?;
 
@@ -671,6 +756,17 @@ impl ApiClient {
         let response = self
             .client
             .post(format!("{}/jobs/{job_id}/prepare", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn cancel_job(&self, job_id: &str) -> Result<JobStatus> {
+        let response = self
+            .client
+            .post(format!("{}/jobs/{job_id}/cancel", self.base_url))
             .bearer_auth(&self.api_key)
             .send()
             .await?;
@@ -773,7 +869,7 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
-    pub async fn get_output_batches(&self, job_id: &str) -> Result<JobOutputBatchesResponse> {
+    pub async fn get_output_batches(&self, job_id: &str) -> Result<JobOutputResponse> {
         let response = self
             .client
             .get(format!("{}/jobs/{job_id}/output-batches", self.base_url))
@@ -795,14 +891,30 @@ impl ApiClient {
         self.handle_response(response).await
     }
 
-    pub async fn health_check(&self) -> bool {
-        self.client
+    pub async fn health_check(&self) -> Result<()> {
+        let response = self
+            .client
             .get(format!("{}/health", self.base_url))
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
+            .map_err(|error| {
+                CfmpegError::ApiUnreachable(format!(
+                    "{} ({})",
+                    self.base_url,
+                    describe_http_error(&error)
+                ))
+            })?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(CfmpegError::ApiUnreachable(format!(
+                "{} (health returned {})",
+                self.base_url,
+                response.status()
+            )))
+        }
     }
 
     async fn handle_response<T: serde::de::DeserializeOwned>(
@@ -812,7 +924,7 @@ impl ApiClient {
         let status = response.status();
 
         if status.is_success() {
-            return response.json::<T>().await.map_err(CfmpegError::Http);
+            return response.json::<T>().await.map_err(CfmpegError::from);
         }
 
         let status_code = status.as_u16();
