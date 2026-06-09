@@ -610,10 +610,7 @@ exit 1
         &missing_crate_script,
         workspace.path(),
         Some(&stub_bin),
-        &[(
-            "GITHUB_OUTPUT",
-            missing_github_output.to_str().unwrap(),
-        )],
+        &[("GITHUB_OUTPUT", missing_github_output.to_str().unwrap())],
     );
     assert_success(&output);
 
