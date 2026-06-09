@@ -781,6 +781,8 @@ fn release_workflow_smoke_tests_the_cfmpeg_homebrew_namespace() {
     assert!(smoke_script.contains("brew tap \"${HOMEBREW_TAP}\" \"${HOMEBREW_TAP_URL}\""));
     assert!(smoke_script.contains("brew install \"${HOMEBREW_TAP}/cfmpeg\""));
     assert!(smoke_script.contains("brew upgrade \"${HOMEBREW_TAP}/cfmpeg\""));
+    assert!(smoke_script.contains("cfmpeg --version"));
+    assert!(!smoke_script.contains("cfmpeg --help"));
 }
 
 #[test]

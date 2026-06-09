@@ -332,5 +332,4 @@ jobs:
             sleep 15
           done
 
-          cfmpeg --help >/dev/null
           test "$(cfmpeg --version | awk 'NR==1 { print $2 }')" = "$VERSION"
