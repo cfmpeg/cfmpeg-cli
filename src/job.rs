@@ -6,7 +6,7 @@ use reqwest::Client;
 use reqwest_eventsource::{Event, EventSource};
 use std::time::Duration;
 
-const JOB_TIMEOUT_SECS: u64 = 3600;
+pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 3600;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_TRANSIENT_POLL_ERRORS: u8 = 30;
 
@@ -39,6 +39,7 @@ pub async fn wait_for_completion(
     api: &ApiClient,
     http_client: &Client,
     job_id: &str,
+    timeout_seconds: u64,
 ) -> Result<()> {
     let progress = ProgressBar::new(100);
     progress.set_style(
@@ -48,18 +49,30 @@ pub async fn wait_for_completion(
     );
     progress.set_message("starting");
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+
     if !api.should_stream_progress() {
-        return poll_progress(api, job_id, &progress).await;
+        return poll_progress(api, job_id, &progress, deadline, timeout_seconds).await;
     }
 
-    match stream_progress(api, http_client, job_id, &progress).await {
+    match stream_progress(
+        api,
+        http_client,
+        job_id,
+        &progress,
+        deadline,
+        timeout_seconds,
+    )
+    .await
+    {
         Ok(StreamProgressOutcome::Completed) => {
             progress.finish_with_message("done");
             Ok(())
         }
         Ok(StreamProgressOutcome::Failed(message)) => Err(CfmpegError::JobFailed(message)),
         Ok(StreamProgressOutcome::Cancelled(message)) => Err(CfmpegError::JobFailed(message)),
-        Err(_) => poll_progress(api, job_id, &progress).await,
+        Err(CfmpegError::JobTimeout(seconds)) => Err(CfmpegError::JobTimeout(seconds)),
+        Err(_) => poll_progress(api, job_id, &progress, deadline, timeout_seconds).await,
     }
 }
 
@@ -76,6 +89,8 @@ async fn stream_progress(
     http_client: &Client,
     job_id: &str,
     progress: &ProgressBar,
+    deadline: tokio::time::Instant,
+    timeout_seconds: u64,
 ) -> Result<StreamProgressOutcome> {
     let request = http_client
         .get(api.stream_url(job_id))
@@ -83,15 +98,15 @@ async fn stream_progress(
     let mut events = EventSource::new(request).map_err(|error| {
         CfmpegError::JobFailed(format!("unable to start progress stream: {error}"))
     })?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(JOB_TIMEOUT_SECS);
 
     loop {
         if tokio::time::Instant::now() > deadline {
-            return Err(CfmpegError::JobTimeout(JOB_TIMEOUT_SECS));
+            return Err(CfmpegError::JobTimeout(timeout_seconds));
         }
 
-        match events.next().await {
-            Some(Ok(Event::Message(message))) => {
+        match tokio::time::timeout_at(deadline, events.next()).await {
+            Err(_) => return Err(CfmpegError::JobTimeout(timeout_seconds)),
+            Ok(Some(Ok(Event::Message(message)))) => {
                 if let Ok(event) = serde_json::from_str::<ProgressEvent>(&message.data) {
                     update_progress_bar(progress, &event.progress);
 
@@ -100,13 +115,13 @@ async fn stream_progress(
                     }
                 }
             }
-            Some(Ok(Event::Open)) => {}
-            Some(Err(error)) => {
+            Ok(Some(Ok(Event::Open))) => {}
+            Ok(Some(Err(error))) => {
                 return Err(CfmpegError::JobFailed(format!(
                     "progress stream interrupted: {error}"
                 )));
             }
-            None => {
+            Ok(None) => {
                 return Err(CfmpegError::JobFailed(
                     "progress stream ended unexpectedly".to_string(),
                 ));
@@ -115,13 +130,18 @@ async fn stream_progress(
     }
 }
 
-async fn poll_progress(api: &ApiClient, job_id: &str, progress: &ProgressBar) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(JOB_TIMEOUT_SECS);
+async fn poll_progress(
+    api: &ApiClient,
+    job_id: &str,
+    progress: &ProgressBar,
+    deadline: tokio::time::Instant,
+    timeout_seconds: u64,
+) -> Result<()> {
     let mut transient_errors = 0u8;
 
     loop {
         if tokio::time::Instant::now() > deadline {
-            return Err(CfmpegError::JobTimeout(JOB_TIMEOUT_SECS));
+            return Err(CfmpegError::JobTimeout(timeout_seconds));
         }
 
         let status = match api.get_job_status(job_id).await {

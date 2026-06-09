@@ -144,6 +144,7 @@ async fn run_encode(
 ) -> Result<()> {
     let config = Config::load()?;
     let effective_remote = remote.merge_defaults(&config.remote_execution_defaults()?);
+    let wait_timeout_seconds = remote_wait_timeout_seconds(&effective_remote);
 
     if force_local {
         eprintln!("  warning: running locally because --local was provided.");
@@ -283,7 +284,13 @@ async fn run_encode(
         let monitor_http_client = http_client.clone();
         let monitor_job_id = job.job_id.clone();
         let monitor = tokio::spawn(async move {
-            job::wait_for_completion(&monitor_api, &monitor_http_client, &monitor_job_id).await
+            job::wait_for_completion(
+                &monitor_api,
+                &monitor_http_client,
+                &monitor_job_id,
+                wait_timeout_seconds,
+            )
+            .await
         });
 
         if let Err(error) = stream::stream_input(&http_client, &job.ingest, input_path).await {
@@ -350,7 +357,8 @@ async fn run_encode(
             None
         };
 
-        let completion_result = job::wait_for_completion(&api, &http_client, &job.job_id).await;
+        let completion_result =
+            job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds).await;
         stop_downloads.store(true, Ordering::Relaxed);
 
         match (completion_result, progressive_download) {
@@ -422,7 +430,7 @@ async fn run_encode(
             return Err(error);
         }
 
-        job::wait_for_completion(&api, &http_client, &job.job_id).await?;
+        job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds).await?;
     }
 
     let outputs = api.get_outputs(&job.job_id).await?;
@@ -562,6 +570,13 @@ fn allows_local_fallback(
     config.local_fallback && !effective_remote.requires_strict_remote()
 }
 
+fn remote_wait_timeout_seconds(effective_remote: &remote::RemoteExecutionOptions) -> u64 {
+    effective_remote
+        .timeout_seconds
+        .map(u64::from)
+        .unwrap_or(job::DEFAULT_JOB_TIMEOUT_SECS)
+}
+
 fn should_fallback_to_local(error: &CfmpegError) -> bool {
     matches!(
         error,
@@ -622,7 +637,7 @@ struct DisplayConfig {
 mod tests {
     use super::{
         allows_local_fallback, format_file_size, format_money_from_millicents, format_usage_report,
-        local_output_summary_lines, should_fallback_to_local,
+        local_output_summary_lines, remote_wait_timeout_seconds, should_fallback_to_local,
     };
     use crate::api::UsageResponse;
     use crate::config::Config;
@@ -718,5 +733,15 @@ mod tests {
         };
 
         assert!(!allows_local_fallback(&config, &remote));
+    }
+
+    #[test]
+    fn remote_wait_timeout_prefers_configured_timeout() {
+        let remote = RemoteExecutionOptions {
+            timeout_seconds: Some(45),
+            ..RemoteExecutionOptions::default()
+        };
+
+        assert_eq!(remote_wait_timeout_seconds(&remote), 45);
     }
 }

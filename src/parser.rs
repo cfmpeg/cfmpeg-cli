@@ -57,6 +57,7 @@ const VALUED_OPTION_FAMILIES: &[&str] = &[
     "-filter_threads",
     "-framerate",
     "-frames",
+    "-fpsmax",
     "-fs",
     "-g",
     "-guess_layout_max",
@@ -131,6 +132,7 @@ const FLAG_OPTIONS: &[&str] = &[
     "-accurate_seek",
     "-an",
     "-benchmark",
+    "-copyts",
     "-copy_unknown",
     "-dn",
     "-dump",
@@ -154,6 +156,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
     let mut sandbox_args = Vec::new();
     let mut input_counter = 0usize;
     let mut output_counter = 0usize;
+    let mut pending_input_format: Option<String> = None;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -167,20 +170,31 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
                 CfmpegError::ParseError("-i flag requires an input path or URL".to_string())
             })?;
 
+            if pending_input_format.as_deref() == Some("concat") {
+                return Err(CfmpegError::ParseError(
+                    "concat file lists are not supported for remote execution; use `--local` or expand the concat inputs before submitting the job".to_string(),
+                ));
+            }
+
             let input = classify_input(input_arg)?;
             sandbox_args.push(rewrite_input(&input, input_counter));
             if matches!(input, Input::LocalFile { .. }) {
                 input_counter += 1;
             }
             inputs.push(input);
+            pending_input_format = None;
             index += 1;
             continue;
         }
 
         if is_valued_option(arg) {
+            reject_remote_referenced_option(arg)?;
             sandbox_args.push(arg.clone());
 
             if has_inline_option_value(arg) {
+                if let Some((_, value)) = arg.split_once('=') {
+                    observe_valued_option(arg, value, &mut pending_input_format);
+                }
                 index += 1;
                 continue;
             }
@@ -190,6 +204,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
             let value = args
                 .get(index)
                 .ok_or_else(|| CfmpegError::ParseError(format!("{arg} requires an argument")))?;
+            observe_valued_option(arg, value, &mut pending_input_format);
             sandbox_args.push(value.clone());
             index += 1;
             continue;
@@ -203,13 +218,6 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
 
         if arg.starts_with('-') && arg.len() > 1 {
             sandbox_args.push(arg.clone());
-
-            if should_consume_unknown_option_value(args, index) {
-                sandbox_args.push(args[index + 1].clone());
-                index += 2;
-                continue;
-            }
-
             index += 1;
             continue;
         }
@@ -280,6 +288,12 @@ fn classify_input(path: &str) -> Result<Input> {
         return Ok(Input::Url(path.to_string()));
     }
 
+    if is_remote_unsupported_input(path) {
+        return Err(CfmpegError::ParseError(format!(
+            "input `{path}` cannot be used for remote execution; stdin, pipe, and /dev inputs require `--local`"
+        )));
+    }
+
     if is_special_input(path) {
         return Ok(Input::Special(path.to_string()));
     }
@@ -305,14 +319,15 @@ fn is_remote_url(path: &str) -> bool {
 }
 
 fn is_special_input(path: &str) -> bool {
-    path == "-"
-        || path.starts_with("pipe:")
-        || path.starts_with("/dev/")
-        || path.starts_with("lavfi:")
+    path.starts_with("lavfi:")
         || path.starts_with("color=")
         || path.starts_with("testsrc")
         || path.starts_with("anullsrc")
         || path.starts_with("nullsrc")
+}
+
+fn is_remote_unsupported_input(path: &str) -> bool {
+    path == "-" || path.starts_with("pipe:") || path.starts_with("/dev/")
 }
 
 fn rewrite_input(input: &Input, input_counter: usize) -> String {
@@ -372,36 +387,22 @@ fn has_inline_option_value(arg: &str) -> bool {
         .is_some_and(|(option, _)| option.starts_with('-'))
 }
 
-fn should_consume_unknown_option_value(args: &[String], index: usize) -> bool {
-    let Some(next_arg) = args.get(index + 1) else {
-        return false;
-    };
-
-    if has_inline_option_value(&args[index])
-        || next_arg.starts_with('-')
-        || index + 1 >= args.len() - 1
-    {
-        return false;
+fn observe_valued_option(arg: &str, value: &str, pending_input_format: &mut Option<String>) {
+    if option_name(arg) == "-f" {
+        *pending_input_format = Some(value.to_ascii_lowercase());
     }
-
-    !starts_multi_positional_run(args, index + 1)
 }
 
-fn starts_multi_positional_run(args: &[String], start: usize) -> bool {
-    let mut count = 0usize;
-
-    for arg in &args[start..] {
-        if arg.starts_with('-') {
-            break;
-        }
-
-        count += 1;
-        if count > 1 {
-            return true;
-        }
+fn reject_remote_referenced_option(arg: &str) -> Result<()> {
+    if matches_option_family(arg, "-filter_complex_script")
+        || matches_option_family(arg, "-filter_script")
+    {
+        return Err(CfmpegError::ParseError(format!(
+            "{arg} references a local script file, which is not supported for remote execution; use `--local` or inline the filter graph"
+        )));
     }
 
-    false
+    Ok(())
 }
 
 #[cfg(test)]
@@ -629,5 +630,113 @@ mod tests {
                 "/tmp/cfmpeg/outputs/output_1.mp4",
             ]
         );
+    }
+
+    #[test]
+    fn does_not_consume_single_output_before_following_flag_as_unknown_option_value() {
+        let args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mp4".to_string(),
+            "-copyts".to_string(),
+            "output.mp4".to_string(),
+            "-y".to_string(),
+        ];
+
+        let parsed = parse_ffmpeg_args(&args).expect("parsed command");
+
+        assert_eq!(parsed.outputs.len(), 1);
+        assert_eq!(parsed.outputs[0].path, PathBuf::from("output.mp4"));
+        assert_eq!(
+            parsed.sandbox_args,
+            vec![
+                "-i",
+                "https://example.com/input.mp4",
+                "-copyts",
+                "/tmp/cfmpeg/outputs/output_0.mp4",
+                "-y",
+            ]
+        );
+    }
+
+    #[test]
+    fn consumes_fpsmax_value_before_output() {
+        let args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mp4".to_string(),
+            "-fpsmax".to_string(),
+            "60".to_string(),
+            "output.mp4".to_string(),
+        ];
+
+        let parsed = parse_ffmpeg_args(&args).expect("parsed command");
+
+        assert_eq!(parsed.outputs.len(), 1);
+        assert_eq!(parsed.outputs[0].path, PathBuf::from("output.mp4"));
+        assert_eq!(
+            parsed.sandbox_args,
+            vec![
+                "-i",
+                "https://example.com/input.mp4",
+                "-fpsmax",
+                "60",
+                "/tmp/cfmpeg/outputs/output_0.mp4",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_concat_filelist_inputs_for_remote_execution() {
+        let dir = temp_path("concat-remote");
+        fs::create_dir_all(&dir).expect("concat dir");
+        let list_path = dir.join("files.txt");
+        fs::write(&list_path, "file './one.mp4'\n").expect("concat file");
+
+        let args = vec![
+            "-f".to_string(),
+            "concat".to_string(),
+            "-i".to_string(),
+            list_path.display().to_string(),
+            "output.mp4".to_string(),
+        ];
+
+        let error = parse_ffmpeg_args(&args).expect_err("concat should be rejected");
+
+        assert!(error.to_string().contains("concat file lists"));
+
+        let _ = fs::remove_file(list_path);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_filter_complex_scripts_for_remote_execution() {
+        let args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mp4".to_string(),
+            "-filter_complex_script".to_string(),
+            "filters.txt".to_string(),
+            "output.mp4".to_string(),
+        ];
+
+        let error = parse_ffmpeg_args(&args).expect_err("script should be rejected");
+
+        assert!(error.to_string().contains("-filter_complex_script"));
+    }
+
+    #[test]
+    fn rejects_stdin_pipe_and_device_inputs_for_remote_execution() {
+        for input in ["-", "pipe:0", "/dev/video0"] {
+            let args = vec![
+                "-i".to_string(),
+                input.to_string(),
+                "output.mp4".to_string(),
+            ];
+
+            let error = parse_ffmpeg_args(&args).expect_err("special input should be rejected");
+
+            assert!(
+                error.to_string().contains("remote execution"),
+                "unexpected error for {input}: {error}"
+            );
+        }
     }
 }
