@@ -147,12 +147,20 @@ jobs:
         id: existing_crate
         run: |
           VERSION="${{ needs.release.outputs.version }}"
-          SEARCH_OUTPUT="$(cargo search cfmpeg --limit 5)"
-          if printf '%s\n' "$SEARCH_OUTPUT" | grep -Eq '^cfmpeg = "'"${VERSION}"'"([[:space:]]|$)'; then
+          CHECK_DIR="$(mktemp -d)"
+          CHECK_OUTPUT="$(mktemp)"
+          trap 'rm -rf "$CHECK_DIR" "$CHECK_OUTPUT"' EXIT
+
+          if (cd "$CHECK_DIR" && cargo info "cfmpeg@${VERSION}" --color never > "$CHECK_OUTPUT" 2>&1); then
             echo "Crate cfmpeg ${VERSION} already exists; skipping crates.io publish."
             echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
+          elif grep -Fq "could not find \`cfmpeg@${VERSION}\`" "$CHECK_OUTPUT"; then
+            echo "Crate cfmpeg ${VERSION} does not exist yet."
             echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            cat "$CHECK_OUTPUT" >&2
+            echo "::error::Unable to check whether crate cfmpeg ${VERSION} exists."
+            exit 1
           fi
 
       - name: Require crates.io token

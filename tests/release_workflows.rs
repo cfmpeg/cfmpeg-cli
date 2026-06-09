@@ -558,10 +558,69 @@ fn release_workflow_skips_crates_io_publish_when_version_already_exists() {
     let existing_crate_script = steps[existing_crate_index]["run"]
         .as_str()
         .expect("existing crate version check step should have a run script");
-    assert!(existing_crate_script.contains("cargo search cfmpeg --limit 5"));
+    assert!(existing_crate_script.contains("cargo info \"cfmpeg@${VERSION}\" --color never"));
     assert!(!existing_crate_script.contains("https://crates.io/api/v1/crates/cfmpeg/"));
     assert!(existing_crate_script.contains("exists=true"));
     assert!(existing_crate_script.contains("exists=false"));
+
+    let workspace = tempdir().expect("failed to create crate check tempdir");
+    let stub_bin = workspace.path().join("bin");
+    fs::create_dir_all(&stub_bin).expect("failed to create stub bin directory");
+    write_executable(
+        &stub_bin.join("cargo"),
+        r#"#!/bin/sh
+if [ "$1" = "info" ] && [ "$2" = "cfmpeg@0.1.0" ] && [ "$3" = "--color" ] && [ "$4" = "never" ]; then
+  echo 'version: 0.1.0'
+  exit 0
+fi
+
+if [ "$1" = "info" ] && [ "$2" = "cfmpeg@0.2.0" ] && [ "$3" = "--color" ] && [ "$4" = "never" ]; then
+  echo 'error: could not find `cfmpeg@0.2.0` in registry `https://github.com/rust-lang/crates.io-index`' >&2
+  exit 101
+fi
+
+echo "unexpected cargo invocation: $*" >&2
+exit 1
+"#,
+    );
+    let github_output = workspace.path().join("github-output.txt");
+    let existing_crate_script_for_existing_version = render(
+        existing_crate_script,
+        &[("${{ needs.release.outputs.version }}", "0.1.0")],
+    );
+    let output = run_script(
+        &existing_crate_script_for_existing_version,
+        workspace.path(),
+        Some(&stub_bin),
+        &[("GITHUB_OUTPUT", github_output.to_str().unwrap())],
+    );
+    assert_success(&output);
+
+    assert_eq!(
+        fs::read_to_string(&github_output).expect("failed to read GitHub output"),
+        "exists=true\n"
+    );
+
+    let missing_github_output = workspace.path().join("missing-github-output.txt");
+    let missing_crate_script = render(
+        existing_crate_script,
+        &[("${{ needs.release.outputs.version }}", "0.2.0")],
+    );
+    let output = run_script(
+        &missing_crate_script,
+        workspace.path(),
+        Some(&stub_bin),
+        &[(
+            "GITHUB_OUTPUT",
+            missing_github_output.to_str().unwrap(),
+        )],
+    );
+    assert_success(&output);
+
+    assert_eq!(
+        fs::read_to_string(&missing_github_output).expect("failed to read GitHub output"),
+        "exists=false\n"
+    );
 
     let require_token_step = workflow_step(publish_job, "Require crates.io token");
     assert_eq!(
