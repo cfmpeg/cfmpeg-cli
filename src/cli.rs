@@ -328,9 +328,21 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
                 )?)?);
             }
             _ if arg.starts_with("--cf-") => {
-                return Err(CfmpegError::ParseError(format!(
-                    "unknown remote execution flag: {arg}"
-                )));
+                return Err(CfmpegError::ParseError(match suggested_cfmpeg_flag(arg) {
+                    Some(suggestion) => format!(
+                        "unknown remote execution flag: {arg}; did you mean `{suggestion}`?"
+                    ),
+                    None => format!("unknown remote execution flag: {arg}"),
+                }));
+            }
+            _ if arg.starts_with("--") => {
+                if let Some(suggestion) = suggested_cfmpeg_flag(arg) {
+                    return Err(CfmpegError::ParseError(format!(
+                        "unknown cfmpeg flag: {arg}; did you mean `{suggestion}`?"
+                    )));
+                }
+
+                ffmpeg_args.push(arg.clone());
             }
             _ => ffmpeg_args.push(arg.clone()),
         }
@@ -390,6 +402,64 @@ fn value_after_flag<'a>(args: &'a [String], index: usize, flag: &str) -> Result<
     args.get(index)
         .map(String::as_str)
         .ok_or_else(|| CfmpegError::ParseError(format!("{flag} requires a value")))
+}
+
+fn suggested_cfmpeg_flag(arg: &str) -> Option<&'static str> {
+    const OWNED_FLAGS: &[&str] = &[
+        "--local",
+        "--remote",
+        "--no-download",
+        "--cf-profile",
+        "--cf-cpu",
+        "--cf-memory",
+        "--cf-timeout",
+    ];
+
+    let candidate = arg.split_once('=').map(|(flag, _)| flag).unwrap_or(arg);
+
+    OWNED_FLAGS
+        .iter()
+        .filter_map(|flag| {
+            let distance = damerau_levenshtein_distance(candidate, flag);
+            (distance <= 2).then_some((*flag, distance))
+        })
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(flag, _)| flag)
+}
+
+fn damerau_levenshtein_distance(left: &str, right: &str) -> usize {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut distances = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+
+    for (index, row) in distances.iter_mut().enumerate() {
+        row[0] = index;
+    }
+
+    for (index, distance) in distances[0].iter_mut().enumerate() {
+        *distance = index;
+    }
+
+    for left_index in 1..=left.len() {
+        for right_index in 1..=right.len() {
+            let substitution_cost = usize::from(left[left_index - 1] != right[right_index - 1]);
+            let mut distance = (distances[left_index - 1][right_index] + 1)
+                .min(distances[left_index][right_index - 1] + 1)
+                .min(distances[left_index - 1][right_index - 1] + substitution_cost);
+
+            if left_index > 1
+                && right_index > 1
+                && left[left_index - 1] == right[right_index - 2]
+                && left[left_index - 2] == right[right_index - 1]
+            {
+                distance = distance.min(distances[left_index - 2][right_index - 2] + 1);
+            }
+
+            distances[left_index][right_index] = distance;
+        }
+    }
+
+    distances[left.len()][right.len()]
 }
 
 #[cfg(test)]
@@ -575,6 +645,20 @@ mod tests {
                 remote: RemoteExecutionOptions::default(),
             }
         );
+    }
+
+    #[test]
+    fn rejects_near_miss_cfmpeg_owned_flags() {
+        let remote_error =
+            parse_args(args(&["--remot", "-i", "input.mov", "output.mp4"])).expect_err("error");
+        assert!(remote_error.to_string().contains("did you mean `--remote`"));
+
+        let no_download_error =
+            parse_args(args(&["--no-downlaod", "-i", "input.mov", "output.mp4"]))
+                .expect_err("error");
+        assert!(no_download_error
+            .to_string()
+            .contains("did you mean `--no-download`"));
     }
 
     #[test]
