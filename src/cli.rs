@@ -16,7 +16,10 @@ pub enum Command {
         no_download: bool,
         remote: RemoteExecutionOptions,
     },
-    Help,
+    Help {
+        topic: HelpTopic,
+        exit_success: bool,
+    },
     Usage,
     Version,
 }
@@ -35,58 +38,115 @@ pub enum ConfigAction {
     Show,
 }
 
-fn help_text() -> &'static str {
-    concat!(
-        "cfmpeg\n",
-        "\n",
-        "Usage:\n",
-        "  cfmpeg [--local|--remote] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-timeout <duration>] <ffmpeg args...>\n",
-        "  cfmpeg auth <login|status|logout>\n",
-        "  cfmpeg cancel <job_id>\n",
-        "  cfmpeg config [path|show|edit]\n",
-        "  cfmpeg usage\n",
-        "  cfmpeg --version\n",
-        "  cfmpeg help\n",
-        "\n",
-        "Notes:\n",
-        "  - Arguments that look like ffmpeg flags are passed through directly.\n",
-        "  - Use `--local` to force local ffmpeg execution.\n",
-        "  - Use `--remote` to require cloud execution and disable local fallback for that run.\n",
-        "  - Use `--no-download` to leave completed outputs in cloud storage and print signed URLs instead.\n",
-        "  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.\n",
-        "  - Use `cfmpeg --help` or `cfmpeg help` for CLI help.\n",
-        "\n",
-        "Examples:\n",
-        "  cfmpeg --remote -f lavfi -i testsrc=size=128x128:rate=1 -t 1 -pix_fmt yuv420p /tmp/cfmpeg-smoke.mp4\n",
-        "  cfmpeg --remote -i https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4 -c:v libx264 -crf 30 -preset veryfast /tmp/cfmpeg-url-smoke.mp4\n",
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpTopic {
+    Global,
+    Auth,
+    Cancel,
+    Config,
+    Usage,
+}
+
+fn help_text(topic: HelpTopic) -> &'static str {
+    match topic {
+        HelpTopic::Global => concat!(
+            "cfmpeg\n",
+            "\n",
+            "Usage:\n",
+            "  cfmpeg [--local|--remote] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-timeout <duration>] <ffmpeg args...>\n",
+            "  cfmpeg auth <login|status|logout>\n",
+            "  cfmpeg cancel <job_id>\n",
+            "  cfmpeg config [path|show|edit]\n",
+            "  cfmpeg usage\n",
+            "  cfmpeg --version\n",
+            "  cfmpeg help [auth|cancel|config|usage]\n",
+            "\n",
+            "Notes:\n",
+            "  - Arguments that look like ffmpeg flags are passed through directly.\n",
+            "  - Use `--local` to force local ffmpeg execution.\n",
+            "  - Use `--remote` to require cloud execution and disable local fallback for that run.\n",
+            "  - Use `--no-download` to leave completed outputs in cloud storage and print signed URLs instead.\n",
+            "  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.\n",
+            "  - Use `cfmpeg --help` or `cfmpeg help` for CLI help.\n",
+            "\n",
+            "Examples:\n",
+            "  cfmpeg --remote -f lavfi -i testsrc=size=128x128:rate=1 -t 1 -pix_fmt yuv420p /tmp/cfmpeg-smoke.mp4\n",
+            "  cfmpeg --remote -i https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4 -c:v libx264 -crf 30 -preset veryfast /tmp/cfmpeg-url-smoke.mp4\n",
+        ),
+        HelpTopic::Auth => concat!(
+            "cfmpeg auth\n",
+            "\n",
+            "Usage:\n",
+            "  cfmpeg auth [status]\n",
+            "  cfmpeg auth login\n",
+            "  cfmpeg auth logout\n",
+            "\n",
+            "Notes:\n",
+            "  - With no action, `cfmpeg auth` prints the current auth status.\n",
+            "  - `cfmpeg auth login` opens the API key page and stores the pasted key locally.\n",
+            "  - `cfmpeg auth status` masks saved API keys in its output.\n",
+        ),
+        HelpTopic::Cancel => concat!(
+            "cfmpeg cancel\n",
+            "\n",
+            "Usage:\n",
+            "  cfmpeg cancel <job_id>\n",
+            "\n",
+            "Cancel a remote job by id.\n",
+        ),
+        HelpTopic::Config => concat!(
+            "cfmpeg config\n",
+            "\n",
+            "Usage:\n",
+            "  cfmpeg config [path]\n",
+            "  cfmpeg config show\n",
+            "  cfmpeg config edit\n",
+            "\n",
+            "Notes:\n",
+            "  - With no action, `cfmpeg config` prints the active config path.\n",
+            "  - `cfmpeg config show` prints the current config with API keys masked.\n",
+            "  - `cfmpeg config edit` opens the config file in $EDITOR.\n",
+        ),
+        HelpTopic::Usage => concat!(
+            "cfmpeg usage\n",
+            "\n",
+            "Usage:\n",
+            "  cfmpeg usage\n",
+            "\n",
+            "Print the current billing-period summary for the authenticated account.\n",
+        ),
+    }
 }
 
 pub fn parse_args(raw_args: Vec<String>) -> Result<Command> {
     if raw_args.is_empty() {
-        return Ok(Command::Help);
+        return Ok(help_command(HelpTopic::Global, false));
     }
 
     if matches!(raw_args.as_slice(), [arg] if arg == "--help" || arg == "-h") {
-        return Ok(Command::Help);
+        return Ok(help_command(HelpTopic::Global, true));
     }
 
     match raw_args[0].as_str() {
         "auth" => parse_auth(&raw_args[1..]),
         "cancel" => parse_cancel(&raw_args[1..]),
         "config" => parse_config(&raw_args[1..]),
-        "help" => Ok(Command::Help),
-        "usage" => parse_exact(raw_args, Command::Usage),
+        "help" => parse_help(&raw_args[1..]),
+        "usage" => parse_usage(&raw_args[1..]),
         "version" => parse_exact(raw_args, Command::Version),
         _ => parse_passthrough(raw_args),
     }
 }
 
-pub fn print_help() {
-    print!("{}", help_text());
+pub fn print_help(topic: HelpTopic) {
+    print!("{}", help_text(topic));
 }
 
 fn parse_auth(args: &[String]) -> Result<Command> {
+    if is_help_request(args) {
+        return Ok(help_command(HelpTopic::Auth, true));
+    }
+
     match args {
         [] => Ok(Command::Auth(AuthAction::Status)),
         [action] => match action.as_str() {
@@ -94,7 +154,7 @@ fn parse_auth(args: &[String]) -> Result<Command> {
             "logout" => Ok(Command::Auth(AuthAction::Logout)),
             "status" => Ok(Command::Auth(AuthAction::Status)),
             _ => Err(CfmpegError::ParseError(format!(
-                "unknown auth action: {action}"
+                "unknown auth action: {action}; expected login, status, logout, or --help"
             ))),
         },
         _ => Err(CfmpegError::ParseError(
@@ -104,6 +164,10 @@ fn parse_auth(args: &[String]) -> Result<Command> {
 }
 
 fn parse_cancel(args: &[String]) -> Result<Command> {
+    if is_help_request(args) {
+        return Ok(help_command(HelpTopic::Cancel, true));
+    }
+
     match args {
         [job_id] => Ok(Command::Cancel {
             job_id: job_id.clone(),
@@ -115,6 +179,10 @@ fn parse_cancel(args: &[String]) -> Result<Command> {
 }
 
 fn parse_config(args: &[String]) -> Result<Command> {
+    if is_help_request(args) {
+        return Ok(help_command(HelpTopic::Config, true));
+    }
+
     match args {
         [] => Ok(Command::Config(None)),
         [action] => match action.as_str() {
@@ -122,12 +190,64 @@ fn parse_config(args: &[String]) -> Result<Command> {
             "path" => Ok(Command::Config(Some(ConfigAction::Path))),
             "show" => Ok(Command::Config(Some(ConfigAction::Show))),
             _ => Err(CfmpegError::ParseError(format!(
-                "unknown config action: {action}"
+                "unknown config action: {action}; expected path, show, edit, or --help"
             ))),
         },
         _ => Err(CfmpegError::ParseError(
             "config accepts at most one action".to_string(),
         )),
+    }
+}
+
+fn parse_help(args: &[String]) -> Result<Command> {
+    match args {
+        [] => Ok(help_command(HelpTopic::Global, true)),
+        [topic] => help_topic(topic)
+            .map(|topic| help_command(topic, true))
+            .ok_or_else(|| {
+                CfmpegError::ParseError(format!(
+                    "unknown help topic: {topic}; expected auth, cancel, config, or usage"
+                ))
+            }),
+        _ => Err(CfmpegError::ParseError(
+            "help accepts at most one topic".to_string(),
+        )),
+    }
+}
+
+fn parse_usage(args: &[String]) -> Result<Command> {
+    if is_help_request(args) {
+        return Ok(help_command(HelpTopic::Usage, true));
+    }
+
+    if args.is_empty() {
+        Ok(Command::Usage)
+    } else {
+        Err(CfmpegError::ParseError(
+            "usage does not accept additional arguments; use `cfmpeg usage --help` for help"
+                .to_string(),
+        ))
+    }
+}
+
+fn help_command(topic: HelpTopic, exit_success: bool) -> Command {
+    Command::Help {
+        topic,
+        exit_success,
+    }
+}
+
+fn is_help_request(args: &[String]) -> bool {
+    matches!(args, [arg] if arg == "--help" || arg == "-h")
+}
+
+fn help_topic(topic: &str) -> Option<HelpTopic> {
+    match topic {
+        "auth" => Some(HelpTopic::Auth),
+        "cancel" => Some(HelpTopic::Cancel),
+        "config" => Some(HelpTopic::Config),
+        "usage" => Some(HelpTopic::Usage),
+        _ => None,
     }
 }
 
@@ -229,7 +349,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     }
 
     if ffmpeg_args.is_empty() {
-        return Ok(Command::Help);
+        return Ok(help_command(HelpTopic::Global, false));
     }
 
     if force_remote {
@@ -274,7 +394,7 @@ fn value_after_flag<'a>(args: &'a [String], index: usize, flag: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{help_text, parse_args, AuthAction, Command, ConfigAction};
+    use super::{help_text, parse_args, AuthAction, Command, ConfigAction, HelpTopic};
     use crate::remote::{RemoteExecutionOptions, PROFILE_HIGHCPU};
 
     fn args(parts: &[&str]) -> Vec<String> {
@@ -356,9 +476,47 @@ mod tests {
     fn parses_common_help_flags_as_cli_help() {
         assert_eq!(
             parse_args(args(&["--help"])).expect("command"),
-            Command::Help
+            Command::Help {
+                topic: HelpTopic::Global,
+                exit_success: true,
+            }
         );
-        assert_eq!(parse_args(args(&["-h"])).expect("command"), Command::Help);
+        assert_eq!(
+            parse_args(args(&["-h"])).expect("command"),
+            Command::Help {
+                topic: HelpTopic::Global,
+                exit_success: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_no_args_as_unsuccessful_help() {
+        assert_eq!(
+            parse_args(args(&[])).expect("command"),
+            Command::Help {
+                topic: HelpTopic::Global,
+                exit_success: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_subcommand_help_flags_as_successful_help() {
+        assert_eq!(
+            parse_args(args(&["auth", "--help"])).expect("command"),
+            Command::Help {
+                topic: HelpTopic::Auth,
+                exit_success: true,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["config", "-h"])).expect("command"),
+            Command::Help {
+                topic: HelpTopic::Config,
+                exit_success: true,
+            }
+        );
     }
 
     #[test]
@@ -382,15 +540,26 @@ mod tests {
 
     #[test]
     fn does_not_advertise_codecs_in_help() {
-        assert!(!help_text().contains("--codecs"));
+        assert!(!help_text(HelpTopic::Global).contains("--codecs"));
     }
 
     #[test]
     fn advertises_smoke_test_examples_in_help() {
-        let help = help_text();
+        let help = help_text(HelpTopic::Global);
 
         assert!(help.contains("testsrc=size=128x128:rate=1"));
         assert!(help.contains("test-videos.co.uk"));
+    }
+
+    #[test]
+    fn subcommand_help_text_documents_shortcuts_and_actions() {
+        let auth_help = help_text(HelpTopic::Auth);
+        assert!(auth_help.contains("cfmpeg auth [status]"));
+        assert!(auth_help.contains("no action"));
+
+        let config_help = help_text(HelpTopic::Config);
+        assert!(config_help.contains("cfmpeg config [path]"));
+        assert!(config_help.contains("no action"));
     }
 
     #[test]

@@ -61,9 +61,18 @@ async fn run() -> Result<()> {
             no_download,
             remote,
         } => run_encode(&ffmpeg_args, force_local, no_download, remote).await,
-        Command::Help => {
-            cli::print_help();
-            Ok(())
+        Command::Help {
+            topic,
+            exit_success,
+        } => {
+            cli::print_help(topic);
+            if exit_success {
+                Ok(())
+            } else {
+                Err(CfmpegError::ParseError(
+                    "no command or ffmpeg arguments provided".to_string(),
+                ))
+            }
         }
         Command::Usage => show_usage().await,
         Command::Version => show_version().await,
