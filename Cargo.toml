@@ -1,6 +1,6 @@
 [package]
 name = "cfmpeg"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Cloud ffmpeg — run ffmpeg commands on powerful remote containers"
 license = "MIT"
