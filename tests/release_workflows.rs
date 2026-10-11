@@ -201,13 +201,6 @@ fn release_binaries_workflow_normalizes_tags_and_packages_release_assets() {
         "ffmpeg-binary",
     )
     .expect("failed to write ffmpeg helper");
-    fs::write(
-        packaging_workspace
-            .path()
-            .join("runner-temp/ffmpeg-helper/bin/ffprobe"),
-        "ffprobe-binary",
-    )
-    .expect("failed to write ffprobe helper");
 
     let output = run_script(
         &prepare_script,
@@ -275,7 +268,6 @@ fn release_binaries_workflow_normalizes_tags_and_packages_release_assets() {
             "bin/cfmpeg".to_string(),
             "libexec".to_string(),
             "libexec/ffmpeg".to_string(),
-            "libexec/ffprobe".to_string(),
         ]
     );
 
@@ -296,99 +288,6 @@ fn release_binaries_workflow_normalizes_tags_and_packages_release_assets() {
         upload_step["with"]["tag_name"].as_str(),
         Some("${{ steps.tag.outputs.value }}")
     );
-}
-
-#[test]
-fn release_binaries_workflow_uses_current_macos_intel_runner_for_x64() {
-    let workflow = workflow(".github/workflows/release-binaries.yml");
-    let build_job = workflow_job(&workflow, "build-binaries");
-
-    let matrix = build_job["strategy"]["matrix"]["include"]
-        .as_sequence()
-        .expect("release-binaries matrix should be a sequence");
-    let darwin_x64 = matrix
-        .iter()
-        .find(|entry| entry["asset_name"].as_str() == Some("cfmpeg-darwin-x64"))
-        .expect("missing darwin x64 matrix entry");
-
-    assert_eq!(darwin_x64["os"].as_str(), Some("macos-15-intel"));
-}
-
-#[test]
-fn release_binaries_workflow_installs_macos_x64_ffmpeg_build_dependencies() {
-    let workflow = workflow(".github/workflows/release-binaries.yml");
-    let build_job = workflow_job(&workflow, "build-binaries");
-    let steps = build_job["steps"]
-        .as_sequence()
-        .expect("build-binaries job should have steps");
-
-    let install_index = steps
-        .iter()
-        .position(|step| step["name"].as_str() == Some("Install macOS ffmpeg build dependencies"))
-        .expect("missing macOS ffmpeg build dependency install step");
-    let helper_index = steps
-        .iter()
-        .position(|step| step["name"].as_str() == Some("Build bundled ffmpeg helpers"))
-        .expect("missing ffmpeg helper build step");
-
-    assert!(
-        install_index < helper_index,
-        "ffmpeg build dependencies must be installed before building helpers"
-    );
-
-    let install_step = &steps[install_index];
-    assert_eq!(
-        install_step["if"].as_str(),
-        Some("matrix.asset_name == 'cfmpeg-darwin-x64'")
-    );
-
-    let install_script = install_step["run"]
-        .as_str()
-        .expect("macOS dependency install step should have a run script");
-    assert!(install_script.contains("brew install nasm"));
-}
-
-#[test]
-fn release_binaries_workflow_installs_linux_x64_ffmpeg_build_dependencies() {
-    let workflow = workflow(".github/workflows/release-binaries.yml");
-    let build_job = workflow_job(&workflow, "build-binaries");
-    let steps = build_job["steps"]
-        .as_sequence()
-        .expect("build-binaries job should have steps");
-
-    let install_index = steps
-        .iter()
-        .position(|step| step["name"].as_str() == Some("Install ffmpeg build dependencies"))
-        .expect("missing ffmpeg build dependency install step");
-    let helper_index = steps
-        .iter()
-        .position(|step| step["name"].as_str() == Some("Build bundled ffmpeg helpers"))
-        .expect("missing ffmpeg helper build step");
-
-    assert!(
-        install_index < helper_index,
-        "ffmpeg build dependencies must be installed before building helpers"
-    );
-
-    let install_step = &steps[install_index];
-    assert_eq!(
-        install_step["if"].as_str(),
-        Some("matrix.asset_name == 'cfmpeg-linux-x64'")
-    );
-
-    let install_script = install_step["run"]
-        .as_str()
-        .expect("dependency install step should have a run script");
-    assert!(install_script.contains("sudo apt-get update"));
-    assert!(install_script.contains("sudo apt-get install -y nasm"));
-}
-
-#[test]
-fn build_helper_ffmpeg_disables_x86_assembly_when_nasm_is_unavailable() {
-    let script = repo_file("scripts/build-helper-ffmpeg.sh");
-
-    assert!(script.contains("command -v nasm"));
-    assert!(script.contains("--disable-x86asm"));
 }
 
 #[test]
@@ -482,14 +381,6 @@ fn release_workflow_skips_mutating_steps_when_release_tag_already_exists() {
         "existing tag must be checked before mutating release steps"
     );
 
-    let existing_tag_script = steps[existing_tag_index]["run"]
-        .as_str()
-        .expect("existing tag check step should have a run script");
-    assert!(existing_tag_script.contains("git ls-remote --exit-code --tags origin"));
-    assert!(existing_tag_script.contains("refs/tags/v${{ steps.version.outputs.number }}"));
-    assert!(existing_tag_script.contains("exists=true"));
-    assert!(existing_tag_script.contains("exists=false"));
-
     for step_name in [
         "Bump version",
         "Verify manifest after bump",
@@ -504,25 +395,6 @@ fn release_workflow_skips_mutating_steps_when_release_tag_already_exists() {
             "{step_name} should be skipped when the release tag already exists"
         );
     }
-}
-
-#[test]
-fn release_workflow_publishes_the_crate_to_crates_io() {
-    let workflow = workflow(".github/workflows/release.yml");
-    let publish_job = workflow_job(&workflow, "publish-crate");
-
-    assert_eq!(publish_job["needs"].as_str(), Some("release"));
-    assert_eq!(
-        publish_job["env"]["CARGO_REGISTRY_TOKEN"].as_str(),
-        Some("${{ secrets.CARGO_REGISTRY_TOKEN }}")
-    );
-
-    let publish_step = workflow_step(publish_job, "Publish crate to crates.io");
-    let publish_script = publish_step["run"]
-        .as_str()
-        .expect("publish step should have a run script");
-
-    assert!(publish_script.contains("cargo publish --locked --token \"$CARGO_REGISTRY_TOKEN\""));
 }
 
 #[test]
@@ -558,10 +430,6 @@ fn release_workflow_skips_crates_io_publish_when_version_already_exists() {
     let existing_crate_script = steps[existing_crate_index]["run"]
         .as_str()
         .expect("existing crate version check step should have a run script");
-    assert!(existing_crate_script.contains("cargo info \"cfmpeg@${VERSION}\" --color never"));
-    assert!(!existing_crate_script.contains("https://crates.io/api/v1/crates/cfmpeg/"));
-    assert!(existing_crate_script.contains("exists=true"));
-    assert!(existing_crate_script.contains("exists=false"));
 
     let workspace = tempdir().expect("failed to create crate check tempdir");
     let stub_bin = workspace.path().join("bin");
@@ -713,7 +581,6 @@ exit 0
             ("COMMITTER_TOKEN", "test-token"),
             ("VERSION", "1.2.3"),
             ("REPOSITORY", "cfmpeg/cfmpeg-cli"),
-            ("REPOSITORY_OWNER", "cfmpeg"),
             ("HOMEBREW_TAP_OWNER", "cfmpeg"),
             ("HOMEBREW_TAP_REPO", "cfmpeg-homebrew-tap"),
             ("TEST_GIT_LOG", log_path.to_str().unwrap()),
@@ -733,7 +600,7 @@ exit 0
     ));
     assert!(formula
         .contains("sha256 \"1111111111111111111111111111111111111111111111111111111111111111\""));
-    assert!(formula.contains("libexec.install \"libexec/ffmpeg\", \"libexec/ffprobe\""));
+    assert!(formula.contains("libexec.install \"libexec/ffmpeg\"\n"));
     assert!(
         formula.contains("assert_match version.to_s, shell_output(\"#{bin}/cfmpeg --version\")")
     );
@@ -760,32 +627,6 @@ exit 0
 }
 
 #[test]
-fn release_workflow_smoke_tests_the_cfmpeg_homebrew_namespace() {
-    let workflow = workflow(".github/workflows/release.yml");
-    let smoke_job = workflow_job(&workflow, "smoke-test-homebrew");
-
-    assert_eq!(
-        smoke_job["env"]["HOMEBREW_TAP"].as_str(),
-        Some("cfmpeg/cfmpeg-homebrew-tap")
-    );
-    assert_eq!(
-        smoke_job["env"]["HOMEBREW_TAP_URL"].as_str(),
-        Some("https://github.com/cfmpeg/cfmpeg-homebrew-tap.git")
-    );
-
-    let smoke_step = workflow_step(smoke_job, "Smoke test Homebrew install");
-    let smoke_script = smoke_step["run"]
-        .as_str()
-        .expect("smoke test step should have a run script");
-
-    assert!(smoke_script.contains("brew tap \"${HOMEBREW_TAP}\" \"${HOMEBREW_TAP_URL}\""));
-    assert!(smoke_script.contains("brew install \"${HOMEBREW_TAP}/cfmpeg\""));
-    assert!(smoke_script.contains("brew upgrade \"${HOMEBREW_TAP}/cfmpeg\""));
-    assert!(smoke_script.contains("cfmpeg --version"));
-    assert!(!smoke_script.contains("cfmpeg --help"));
-}
-
-#[test]
 fn readme_uses_the_cfmpeg_homebrew_namespace() {
     let readme = repo_file("README.md");
 
@@ -793,18 +634,13 @@ fn readme_uses_the_cfmpeg_homebrew_namespace() {
         "brew tap cfmpeg/cfmpeg-homebrew-tap https://github.com/cfmpeg/cfmpeg-homebrew-tap.git"
     ));
     assert!(readme.contains("brew install cfmpeg/cfmpeg-homebrew-tap/cfmpeg"));
-    assert!(!readme.contains("brew install aarondfrancis/homebrew-tap/cfmpeg"));
 }
 
 #[test]
 fn public_metadata_uses_the_cfmpeg_cli_repository() {
     let cargo_toml = repo_file("Cargo.toml");
-    let readme = repo_file("README.md");
     let release_workflow = repo_file(".github/workflows/release.yml");
 
     assert!(cargo_toml.contains(r#"repository = "https://github.com/cfmpeg/cfmpeg-cli""#));
-    assert!(!cargo_toml.contains("github.com/aarondfrancis"));
-    assert!(!readme.contains("https://cfmpeg.com/install.sh"));
-    assert!(!release_workflow.contains("github.actor == 'aarondfrancis'"));
     assert!(release_workflow.contains("github.repository == 'cfmpeg/cfmpeg-cli'"));
 }

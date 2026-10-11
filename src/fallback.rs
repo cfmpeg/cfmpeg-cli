@@ -11,13 +11,7 @@ pub async fn run_local(ffmpeg_args: &[String]) -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .await
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => CfmpegError::Config(
-                "local ffmpeg was not found; install ffmpeg, configure CFMPEG_FFMPEG_BINARY, or use a cfmpeg release that bundles helper binaries.".to_string(),
-            ),
-            _ => CfmpegError::Io(error),
-        })?;
+        .await?;
 
     if status.success() {
         return Ok(());

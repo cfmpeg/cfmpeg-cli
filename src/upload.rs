@@ -1,31 +1,25 @@
 use crate::api::{
     ApiClient, CompletedMultipartPart, IngestProgressRequest, JobIngest, SegmentUploadTarget,
-    SegmentUploadTargetsRequest, UploadTarget,
+    SegmentUploadTargetsRequest, UploadMethod, UploadTarget,
 };
 use crate::error::{CfmpegError, Result};
 use crate::media_tools::ffmpeg_binary;
+use crate::transfer::{file_name_or, retry_with_backoff, transfer_progress_bar};
 use futures::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use reqwest::header::{HeaderMap, CONTENT_LENGTH, ETAG};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
-use uuid::Uuid;
 
 const MIN_CONCURRENT_UPLOADS: usize = 6;
 const MAX_CONCURRENT_UPLOADS: usize = 24;
 const MIN_CONCURRENT_SEGMENT_UPLOADS: usize = 2;
 const MAX_CONCURRENT_SEGMENT_UPLOADS: usize = 8;
-const MAX_RETRIES: u32 = 3;
-
-pub struct UploadResult {
-    pub multipart_parts: Vec<CompletedMultipartPart>,
-}
 
 struct SegmentUploadContext<'a> {
     api: &'a ApiClient,
@@ -46,36 +40,32 @@ pub async fn upload_file(
     client: &Client,
     file_path: &Path,
     target: &UploadTarget,
-) -> Result<UploadResult> {
+) -> Result<Vec<CompletedMultipartPart>> {
     let file_size = std::fs::metadata(file_path)?.len();
-    let filename = file_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("input")
-        .to_string();
+    let filename = file_name_or(file_path, "input");
 
-    let progress = ProgressBar::new(file_size);
-    progress.set_style(
-        ProgressStyle::with_template("  Uploading {msg} {bar:40.cyan/blue} {bytes}/{total_bytes}")
-            .expect("progress template")
-            .progress_chars("##-"),
+    let progress = transfer_progress_bar(
+        "Uploading",
+        file_size,
+        if target.filename.is_empty() {
+            filename.clone()
+        } else {
+            target.filename.clone()
+        },
     );
-    progress.set_message(if target.filename.is_empty() {
-        filename.clone()
-    } else {
-        target.filename.clone()
-    });
 
     let upload_result = if should_use_multipart(target) {
         multipart_upload(client, file_path, file_size, target, &progress).await
     } else {
-        direct_upload(client, file_path, target, &progress).await
+        direct_upload(client, file_path, target, &progress)
+            .await
+            .map(|()| Vec::new())
     };
 
     match upload_result {
-        Ok(result) => {
-            progress.finish_with_message(filename.clone());
-            Ok(result)
+        Ok(parts) => {
+            progress.finish_with_message(filename);
+            Ok(parts)
         }
         Err(error) => {
             progress.abandon_with_message(filename);
@@ -102,24 +92,14 @@ pub async fn upload_segmented_file(
     }
 
     let file_size = std::fs::metadata(file_path)?.len();
-    let filename = file_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("input")
-        .to_string();
-
-    let progress = ProgressBar::new(file_size);
-    progress.set_style(
-        ProgressStyle::with_template("  Uploading {msg} {bar:40.cyan/blue} {bytes}/{total_bytes}")
-            .expect("progress template")
-            .progress_chars("##-"),
-    );
-    progress.set_message(filename.clone());
+    let filename = file_name_or(file_path, "input");
+    let progress = transfer_progress_bar("Uploading", file_size, filename.clone());
 
     let ffmpeg = ffmpeg_binary()?;
-    let segment_dir = std::env::temp_dir().join(format!("cfmpeg-segments-{}", Uuid::new_v4()));
-    tokio::fs::create_dir_all(&segment_dir).await?;
-    let segment_template = segment_dir.join("segment_%06d.mp4");
+    let segment_dir = tempfile::Builder::new()
+        .prefix("cfmpeg-segments-")
+        .tempdir()?;
+    let segment_template = segment_dir.path().join("segment_%06d.mp4");
 
     let mut segmenter = Command::new(ffmpeg);
     segmenter
@@ -150,7 +130,7 @@ pub async fn upload_segmented_file(
         api,
         client,
         job_id,
-        segment_dir: &segment_dir,
+        segment_dir: segment_dir.path(),
         progress: &progress,
         total_bytes: file_size,
     };
@@ -168,7 +148,6 @@ pub async fn upload_segmented_file(
     let output = child.wait_with_output().await?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let _ = tokio::fs::remove_dir_all(&segment_dir).await;
         progress.abandon_with_message(filename);
         return Err(CfmpegError::Upload {
             filename: file_path.display().to_string(),
@@ -182,15 +161,13 @@ pub async fn upload_segmented_file(
 
     upload_closed_segments(&context, &mut state, true).await?;
 
-    let _ = tokio::fs::remove_dir_all(&segment_dir).await;
-
     progress.finish_with_message(filename);
 
     Ok(state.next_upload_index)
 }
 
 fn should_use_multipart(target: &UploadTarget) -> bool {
-    target.method.eq_ignore_ascii_case("multipart") && !target.part_urls.is_empty()
+    target.method == UploadMethod::Multipart && !target.part_urls.is_empty()
 }
 
 async fn upload_closed_segments(
@@ -199,14 +176,13 @@ async fn upload_closed_segments(
     include_last_segment: bool,
 ) -> Result<()> {
     let concurrency = segment_upload_concurrency(context.total_bytes);
-    let batch_size = segment_target_batch_size(context.total_bytes);
 
     loop {
         let ready_segments = ready_segment_paths(
             context.segment_dir,
             state.next_upload_index,
             include_last_segment,
-            batch_size,
+            concurrency,
         );
 
         if ready_segments.is_empty() {
@@ -232,37 +208,24 @@ async fn upload_closed_segments(
             )));
         }
 
-        let results: Vec<Result<(u32, PathBuf, u64)>> =
+        let results: Vec<Result<(PathBuf, u64)>> =
             stream::iter(ready_segments.into_iter().zip(targets))
-                .map(|((index, path), target)| {
+                .map(|((_, path), target)| {
                     let client = context.client.clone();
 
                     async move {
-                        let bytes_uploaded =
-                            upload_segment_file(&client, &path, &target, &path).await?;
+                        let bytes_uploaded = upload_segment_file(&client, &path, &target).await?;
 
-                        Ok((index, path, bytes_uploaded))
+                        Ok((path, bytes_uploaded))
                     }
                 })
                 .buffer_unordered(concurrency)
                 .collect()
                 .await;
 
-        let mut uploaded_segments = Vec::with_capacity(results.len());
-        for result in results {
-            uploaded_segments.push(result?);
-        }
+        let uploaded_segments = results.into_iter().collect::<Result<Vec<_>>>()?;
 
-        uploaded_segments.sort_by_key(|(index, _, _)| *index);
-
-        for (index, path, bytes_uploaded) in uploaded_segments {
-            if index != state.next_upload_index {
-                return Err(CfmpegError::Protocol(format!(
-                    "segment uploads completed out of order: expected {}, got {}",
-                    state.next_upload_index, index
-                )));
-            }
-
+        for (path, bytes_uploaded) in uploaded_segments {
             state.uploaded_bytes = (state.uploaded_bytes + bytes_uploaded).min(context.total_bytes);
             context.progress.set_position(state.uploaded_bytes);
             tokio::fs::remove_file(&path).await?;
@@ -316,84 +279,50 @@ async fn upload_segment_file(
     client: &Client,
     file_path: &Path,
     target: &SegmentUploadTarget,
-    display_path: &Path,
 ) -> Result<u64> {
     let file_size = tokio::fs::metadata(file_path).await?.len();
+    let upload_error = |reason: String| CfmpegError::Upload {
+        filename: file_path.display().to_string(),
+        reason,
+    };
 
-    for attempt in 0..MAX_RETRIES {
-        let input =
-            tokio::fs::File::open(file_path)
-                .await
-                .map_err(|error| CfmpegError::Upload {
-                    filename: display_path.display().to_string(),
-                    reason: error.to_string(),
-                })?;
+    retry_with_backoff(|| async {
+        let input = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|error| upload_error(error.to_string()))?;
         let body = reqwest::Body::wrap_stream(ReaderStream::new(input));
 
-        let mut request = client.put(&target.upload_url);
+        let response = signed_put(client, &target.upload_url, &target.headers, "video/mp4")
+            .header(CONTENT_LENGTH, file_size.to_string())
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| upload_error(format!("segment {} failed: {error}", target.index)))?;
 
-        for (name, value) in &target.headers {
-            if name.eq_ignore_ascii_case("host") {
-                continue;
-            }
-
-            request = request.header(name, value);
+        if !response.status().is_success() {
+            return Err(upload_error(format!(
+                "segment {} failed with status {}",
+                target.index,
+                response.status()
+            )));
         }
 
-        if !target
-            .headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("content-type"))
-        {
-            request = request.header("Content-Type", "video/mp4");
-        }
-
-        request = request.header(CONTENT_LENGTH, file_size.to_string());
-
-        match request.body(body).send().await {
-            Ok(response) if response.status().is_success() => return Ok(file_size),
-            Ok(response) => {
-                if attempt == MAX_RETRIES - 1 {
-                    return Err(CfmpegError::Upload {
-                        filename: display_path.display().to_string(),
-                        reason: format!(
-                            "segment {} failed with status {}",
-                            target.index,
-                            response.status()
-                        ),
-                    });
-                }
-            }
-            Err(error) => {
-                if attempt == MAX_RETRIES - 1 {
-                    return Err(CfmpegError::Upload {
-                        filename: display_path.display().to_string(),
-                        reason: format!("segment {} failed: {error}", target.index),
-                    });
-                }
-            }
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt))).await;
-    }
-
-    Err(CfmpegError::Upload {
-        filename: display_path.display().to_string(),
-        reason: format!("segment {} failed after retries", target.index),
+        Ok(())
     })
+    .await?;
+
+    Ok(file_size)
 }
 
-async fn direct_upload(
+fn signed_put(
     client: &Client,
-    file_path: &Path,
-    target: &UploadTarget,
-    progress: &ProgressBar,
-) -> Result<UploadResult> {
-    let data = tokio::fs::read(file_path).await?;
+    url: &str,
+    headers: &HashMap<String, String>,
+    default_content_type: &str,
+) -> RequestBuilder {
+    let mut request = client.put(url);
 
-    let mut request = client.put(&target.upload_url);
-
-    for (name, value) in &target.headers {
+    for (name, value) in headers {
         if name.eq_ignore_ascii_case("host") {
             continue;
         }
@@ -401,23 +330,38 @@ async fn direct_upload(
         request = request.header(name, value);
     }
 
-    if !target
-        .headers
+    if !headers
         .keys()
         .any(|name| name.eq_ignore_ascii_case("content-type"))
     {
-        request = request.header("Content-Type", "application/octet-stream");
+        request = request.header("Content-Type", default_content_type);
     }
 
-    let response =
-        request
-            .body(data.clone())
-            .send()
-            .await
-            .map_err(|error| CfmpegError::Upload {
-                filename: file_path.display().to_string(),
-                reason: error.to_string(),
-            })?;
+    request
+}
+
+async fn direct_upload(
+    client: &Client,
+    file_path: &Path,
+    target: &UploadTarget,
+    progress: &ProgressBar,
+) -> Result<()> {
+    let data = tokio::fs::read(file_path).await?;
+    let data_len = data.len() as u64;
+
+    let response = signed_put(
+        client,
+        &target.upload_url,
+        &target.headers,
+        "application/octet-stream",
+    )
+    .body(data)
+    .send()
+    .await
+    .map_err(|error| CfmpegError::Upload {
+        filename: file_path.display().to_string(),
+        reason: error.to_string(),
+    })?;
 
     if !response.status().is_success() {
         return Err(CfmpegError::Upload {
@@ -426,11 +370,9 @@ async fn direct_upload(
         });
     }
 
-    progress.set_position(data.len() as u64);
+    progress.set_position(data_len);
 
-    Ok(UploadResult {
-        multipart_parts: Vec::new(),
-    })
+    Ok(())
 }
 
 async fn multipart_upload(
@@ -439,107 +381,67 @@ async fn multipart_upload(
     file_size: u64,
     target: &UploadTarget,
     progress: &ProgressBar,
-) -> Result<UploadResult> {
+) -> Result<Vec<CompletedMultipartPart>> {
     let part_size = target.part_size as usize;
-    let uploaded_bytes = Arc::new(Mutex::new(0u64));
-    let chunks: Vec<(usize, String)> = target
-        .part_urls
-        .iter()
-        .enumerate()
-        .map(|(index, url)| (index, url.clone()))
-        .collect();
-    let concurrency = multipart_upload_concurrency(chunks.len(), file_size);
+    let concurrency = multipart_upload_concurrency(target.part_urls.len(), file_size);
 
-    let results: Vec<Result<CompletedMultipartPart>> = stream::iter(chunks)
-        .map(|(part_index, part_url)| {
-            let client = client.clone();
-            let file_path = file_path.to_path_buf();
-            let uploaded_bytes = Arc::clone(&uploaded_bytes);
-            let progress = progress.clone();
-
-            async move {
-                let chunk = read_chunk(&file_path, file_size, part_index, part_size).await?;
+    let results: Vec<Result<CompletedMultipartPart>> =
+        stream::iter(target.part_urls.iter().enumerate())
+            .map(|(part_index, part_url)| async move {
+                let chunk = read_chunk(file_path, file_size, part_index, part_size).await?;
                 let chunk_size = chunk.len() as u64;
+                let part_number = part_index + 1;
+                let upload_error = |reason: String| CfmpegError::Upload {
+                    filename: file_path.display().to_string(),
+                    reason,
+                };
 
-                for attempt in 0..MAX_RETRIES {
+                let response = retry_with_backoff(|| async {
                     let response = client
-                        .put(&part_url)
+                        .put(part_url)
                         .header("Content-Type", "application/octet-stream")
                         .body(chunk.clone())
                         .send()
-                        .await;
+                        .await
+                        .map_err(|error| {
+                            upload_error(format!("part {part_number} failed: {error}"))
+                        })?;
 
-                    match response {
-                        Ok(response) if response.status().is_success() => {
-                            let etag =
-                                extract_multipart_etag(response.headers()).ok_or_else(|| {
-                                    CfmpegError::Upload {
-                                        filename: file_path.display().to_string(),
-                                        reason: format!(
-                                            "part {} succeeded without an ETag header",
-                                            part_index + 1
-                                        ),
-                                    }
-                                })?;
-                            let mut uploaded = uploaded_bytes.lock().await;
-                            *uploaded += chunk_size;
-                            progress.set_position(*uploaded);
-                            return Ok(CompletedMultipartPart {
-                                part_number: (part_index + 1) as u32,
-                                etag,
-                            });
-                        }
-                        Ok(response) => {
-                            if attempt == MAX_RETRIES - 1 {
-                                return Err(CfmpegError::Upload {
-                                    filename: file_path.display().to_string(),
-                                    reason: format!(
-                                        "part {} failed with status {}",
-                                        part_index + 1,
-                                        response.status()
-                                    ),
-                                });
-                            }
-                        }
-                        Err(error) => {
-                            if attempt == MAX_RETRIES - 1 {
-                                return Err(CfmpegError::Upload {
-                                    filename: file_path.display().to_string(),
-                                    reason: format!("part {} failed: {error}", part_index + 1),
-                                });
-                            }
-                        }
+                    if !response.status().is_success() {
+                        return Err(upload_error(format!(
+                            "part {part_number} failed with status {}",
+                            response.status()
+                        )));
                     }
 
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt)))
-                        .await;
-                }
-
-                Err(CfmpegError::Upload {
-                    filename: file_path.display().to_string(),
-                    reason: format!("part {} failed after retries", part_index + 1),
+                    Ok(response)
                 })
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+                .await?;
 
-    let mut completed_parts = Vec::with_capacity(results.len());
+                let etag = extract_multipart_etag(response.headers()).ok_or_else(|| {
+                    upload_error(format!(
+                        "part {part_number} succeeded without an ETag header"
+                    ))
+                })?;
+                progress.inc(chunk_size);
 
-    for result in results {
-        completed_parts.push(result?);
-    }
+                Ok(CompletedMultipartPart {
+                    part_number: part_number as u32,
+                    etag,
+                })
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
+    let mut completed_parts = results.into_iter().collect::<Result<Vec<_>>>()?;
     completed_parts.sort();
 
-    Ok(UploadResult {
-        multipart_parts: completed_parts,
-    })
+    Ok(completed_parts)
 }
 
 async fn read_chunk(
-    file_path: &PathBuf,
+    file_path: &Path,
     file_size: u64,
     part_index: usize,
     part_size: usize,
@@ -570,10 +472,6 @@ fn chunk_size_for_part(file_size: u64, part_index: usize, part_size: usize) -> R
 }
 
 fn multipart_upload_concurrency(part_count: usize, file_size: u64) -> usize {
-    if part_count == 0 {
-        return 1;
-    }
-
     let target = if file_size >= 5 * 1024 * 1024 * 1024 {
         MAX_CONCURRENT_UPLOADS
     } else if file_size >= 1024 * 1024 * 1024 {
@@ -584,11 +482,11 @@ fn multipart_upload_concurrency(part_count: usize, file_size: u64) -> usize {
         MIN_CONCURRENT_UPLOADS
     };
 
-    target.clamp(1, MAX_CONCURRENT_UPLOADS).min(part_count)
+    target.min(part_count)
 }
 
 fn segment_upload_concurrency(file_size: u64) -> usize {
-    let target = if file_size >= 5 * 1024 * 1024 * 1024 {
+    if file_size >= 5 * 1024 * 1024 * 1024 {
         MAX_CONCURRENT_SEGMENT_UPLOADS
     } else if file_size >= 1024 * 1024 * 1024 {
         6
@@ -596,16 +494,7 @@ fn segment_upload_concurrency(file_size: u64) -> usize {
         4
     } else {
         MIN_CONCURRENT_SEGMENT_UPLOADS
-    };
-
-    target.clamp(
-        MIN_CONCURRENT_SEGMENT_UPLOADS,
-        MAX_CONCURRENT_SEGMENT_UPLOADS,
-    )
-}
-
-fn segment_target_batch_size(file_size: u64) -> usize {
-    segment_upload_concurrency(file_size)
+    }
 }
 
 fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
@@ -619,7 +508,7 @@ fn extract_multipart_etag(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::{
         chunk_size_for_part, extract_multipart_etag, multipart_upload_concurrency,
-        ready_segment_paths, segment_target_batch_size, segment_upload_concurrency,
+        ready_segment_paths, segment_upload_concurrency,
     };
     use reqwest::header::{HeaderMap, HeaderValue, ETAG};
 
@@ -672,7 +561,6 @@ mod tests {
         assert_eq!(segment_upload_concurrency(512 * 1024 * 1024), 4);
         assert_eq!(segment_upload_concurrency(2 * 1024 * 1024 * 1024), 6);
         assert_eq!(segment_upload_concurrency(8 * 1024 * 1024 * 1024), 8);
-        assert_eq!(segment_target_batch_size(2 * 1024 * 1024 * 1024), 6);
     }
 
     #[test]

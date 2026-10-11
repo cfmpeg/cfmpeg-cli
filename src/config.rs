@@ -73,30 +73,19 @@ impl Config {
     }
 
     pub fn api_key(&self) -> Option<String> {
-        std::env::var("CFMPEG_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| self.api_key.clone())
+        option_from_env("CFMPEG_API_KEY").or_else(|| self.api_key.clone())
     }
 
-    pub fn api_key_from_env(&self) -> bool {
-        std::env::var("CFMPEG_API_KEY")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
+    pub fn api_key_from_env() -> bool {
+        option_from_env("CFMPEG_API_KEY").is_some()
     }
 
     pub fn api_base(&self) -> String {
-        std::env::var("CFMPEG_API_BASE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| self.api_base.clone())
+        option_from_env("CFMPEG_API_BASE").unwrap_or_else(|| self.api_base.clone())
     }
 
     pub fn web_base(&self) -> String {
-        std::env::var("CFMPEG_WEB_BASE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| derive_web_base(&self.api_base()))
+        option_from_env("CFMPEG_WEB_BASE").unwrap_or_else(|| derive_web_base(&self.api_base()))
     }
 
     pub fn dashboard_api_keys_url(&self) -> String {
@@ -142,11 +131,8 @@ impl Config {
     }
 
     fn config_dir() -> Result<PathBuf> {
-        if let Ok(override_dir) = std::env::var("CFMPEG_CONFIG_DIR") {
-            let trimmed = override_dir.trim();
-            if !trimmed.is_empty() {
-                return Ok(PathBuf::from(trimmed));
-            }
+        if let Some(override_dir) = option_from_env("CFMPEG_CONFIG_DIR") {
+            return Ok(PathBuf::from(override_dir));
         }
 
         let base = dirs::config_dir().ok_or_else(|| {
@@ -160,8 +146,8 @@ impl Config {
 fn derive_web_base(api_base: &str) -> String {
     let trimmed = api_base.trim_end_matches('/');
     let without_version = trimmed
-        .strip_suffix("/v1")
-        .or_else(|| trimmed.strip_suffix("/api/v1"))
+        .strip_suffix("/api/v1")
+        .or_else(|| trimmed.strip_suffix("/v1"))
         .unwrap_or(trimmed);
 
     if let Some(rest) = without_version.strip_prefix("https://api.") {
@@ -188,7 +174,7 @@ fn option_from_env(key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{derive_web_base, Config};
     use uuid::Uuid;
 
     fn unique_config_dir() -> std::path::PathBuf {
@@ -252,6 +238,14 @@ mod tests {
         assert_eq!(
             config.dashboard_billing_url(),
             "http://127.0.0.1:8000/dashboard/billing"
+        );
+    }
+
+    #[test]
+    fn derives_web_base_from_api_v1_prefix() {
+        assert_eq!(
+            derive_web_base("https://example.test/api/v1"),
+            "https://example.test"
         );
     }
 

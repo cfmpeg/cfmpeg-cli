@@ -81,8 +81,7 @@ jobs:
           mkdir -p release/bundle/bin release/bundle/libexec
           cp target/release/cfmpeg release/bundle/bin/cfmpeg
           cp "$RUNNER_TEMP/ffmpeg-helper/bin/ffmpeg" release/bundle/libexec/ffmpeg
-          cp "$RUNNER_TEMP/ffmpeg-helper/bin/ffprobe" release/bundle/libexec/ffprobe
-          chmod +x release/bundle/bin/cfmpeg release/bundle/libexec/ffmpeg release/bundle/libexec/ffprobe
+          chmod +x release/bundle/bin/cfmpeg release/bundle/libexec/ffmpeg
           tar -czf "release/${{ matrix.asset_name }}.tar.gz" -C release/bundle .
           shasum -a 256 "release/${{ matrix.asset_name }}.tar.gz" > "release/${{ matrix.asset_name }}.tar.gz.sha256"
 

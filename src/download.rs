@@ -1,9 +1,10 @@
-use crate::api::{ApiClient, OutputBatch, OutputFile};
+use crate::api::{ApiClient, OutputBatch, OutputDeliveryMode, OutputFile};
 use crate::error::{CfmpegError, Result};
 use crate::media_tools::ffmpeg_binary;
 use crate::parser::Output;
+use crate::transfer::{file_name_or, retry_with_backoff, transfer_progress_bar};
 use futures::{stream, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use reqwest::header::CONTENT_RANGE;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -15,13 +16,10 @@ use std::sync::{
 };
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::Mutex;
-use uuid::Uuid;
 
 const PARALLEL_DOWNLOAD_THRESHOLD_BYTES: u64 = 128 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_CHUNK_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CONCURRENT_DOWNLOADS: usize = 8;
-const DOWNLOAD_MAX_RETRIES: u32 = 3;
 const PROGRESSIVE_BATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub async fn download_outputs(
@@ -75,22 +73,23 @@ pub async fn download_progressive_batches(
     target_path: &Path,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let temp_dir = std::env::temp_dir().join(format!("cfmpeg-output-batches-{}", Uuid::new_v4()));
-    tokio::fs::create_dir_all(&temp_dir).await?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("cfmpeg-output-batches-")
+        .tempdir()?;
 
     let mut downloaded: HashMap<u32, PathBuf> = HashMap::new();
 
     loop {
         let response = api.get_output_batches(job_id).await?;
 
-        if !response.is_progressive_batches() {
-            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        if response.delivery_mode != OutputDeliveryMode::ProgressiveBatches {
             return Err(CfmpegError::Protocol(
                 "job does not expose progressive batch outputs".to_string(),
             ));
         }
 
-        download_missing_batches(client, &temp_dir, &mut downloaded, response.batches).await?;
+        download_missing_batches(client, temp_dir.path(), &mut downloaded, response.batches)
+            .await?;
 
         if stop.load(Ordering::Relaxed) || response.complete {
             break;
@@ -101,20 +100,18 @@ pub async fn download_progressive_batches(
 
     let response = api.get_outputs(job_id).await?;
 
-    if !response.is_progressive_batches() {
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    if response.delivery_mode != OutputDeliveryMode::ProgressiveBatches {
         return Err(CfmpegError::Protocol(
             "job does not expose progressive batch outputs".to_string(),
         ));
     }
 
-    download_missing_batches(client, &temp_dir, &mut downloaded, response.batches).await?;
+    download_missing_batches(client, temp_dir.path(), &mut downloaded, response.batches).await?;
 
     let mut ordered_batches: Vec<(u32, PathBuf)> = downloaded.into_iter().collect();
     ordered_batches.sort_by_key(|(index, _)| *index);
 
     if ordered_batches.is_empty() {
-        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
         return Err(CfmpegError::Protocol(
             "job completed without any progressive output batches".to_string(),
         ));
@@ -127,11 +124,7 @@ pub async fn download_progressive_batches(
             .collect::<Vec<_>>(),
         target_path,
     )
-    .await?;
-
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-
-    Ok(())
+    .await
 }
 
 async fn download_missing_batches(
@@ -172,25 +165,11 @@ async fn download_file(
     }
 
     let total_bytes = remote_output.size_bytes;
-
-    let progress = ProgressBar::new(total_bytes);
-    progress.set_style(
-        ProgressStyle::with_template(
-            "  Downloading {msg} {bar:40.cyan/blue} {bytes}/{total_bytes}",
-        )
-        .expect("progress template")
-        .progress_chars("##-"),
-    );
-    progress.set_message(
-        target_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("output")
-            .to_string(),
-    );
+    let filename = file_name_or(target_path, "output");
+    let progress = transfer_progress_bar("Downloading", total_bytes, filename.clone());
 
     let download_result = if should_parallel_download(total_bytes)
-        && supports_parallel_download(client, &remote_output.download_url, total_bytes).await?
+        && supports_parallel_download(client, &remote_output.download_url, total_bytes).await
     {
         download_file_parallel(client, remote_output, target_path, &progress).await
     } else {
@@ -199,13 +178,7 @@ async fn download_file(
 
     match download_result {
         Ok(()) => {
-            progress.finish_with_message(
-                target_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("output")
-                    .to_string(),
-            );
+            progress.finish_with_message(filename);
             Ok(())
         }
         Err(error) => {
@@ -219,30 +192,24 @@ fn should_parallel_download(size_bytes: u64) -> bool {
     size_bytes >= PARALLEL_DOWNLOAD_THRESHOLD_BYTES
 }
 
-async fn supports_parallel_download(client: &Client, url: &str, size_bytes: u64) -> Result<bool> {
-    if size_bytes == 0 {
-        return Ok(false);
-    }
-
-    let response = match client.get(url).header("Range", "bytes=0-0").send().await {
-        Ok(response) => response,
-        Err(_) => return Ok(false),
+async fn supports_parallel_download(client: &Client, url: &str, size_bytes: u64) -> bool {
+    let Ok(response) = client.get(url).header("Range", "bytes=0-0").send().await else {
+        return false;
     };
 
     if response.status().as_u16() != 206 {
-        return Ok(false);
+        return false;
     }
 
     let Some(content_range) = response.headers().get(CONTENT_RANGE) else {
-        return Ok(false);
+        return false;
     };
 
     let Ok(content_range) = content_range.to_str() else {
-        return Ok(false);
+        return false;
     };
 
-    Ok(content_range.starts_with("bytes 0-0/")
-        && content_range.ends_with(&format!("/{size_bytes}")))
+    content_range.starts_with("bytes 0-0/") && content_range.ends_with(&format!("/{size_bytes}"))
 }
 
 async fn download_file_sequential(
@@ -294,40 +261,24 @@ async fn download_file_parallel(
     let total_bytes = remote_output.size_bytes;
     let concurrency = download_concurrency(total_bytes);
     let ranges = build_download_ranges(total_bytes, PARALLEL_DOWNLOAD_CHUNK_SIZE_BYTES);
-    let downloaded_bytes = Arc::new(Mutex::new(0u64));
 
     let file = tokio::fs::File::create(target_path).await?;
     file.set_len(total_bytes).await?;
     drop(file);
 
     let results: Vec<Result<()>> = stream::iter(ranges)
-        .map(|(start, end)| {
-            let client = client.clone();
-            let remote_output = remote_output.clone();
-            let target_path = target_path.to_path_buf();
-            let progress = progress.clone();
-            let downloaded_bytes = Arc::clone(&downloaded_bytes);
+        .map(|(start, end)| async move {
+            let bytes_downloaded =
+                download_range(client, remote_output, target_path, start, end).await?;
+            progress.inc(bytes_downloaded);
 
-            async move {
-                let bytes_downloaded =
-                    download_range(&client, &remote_output, &target_path, start, end).await?;
-
-                let mut total = downloaded_bytes.lock().await;
-                *total += bytes_downloaded;
-                progress.set_position(*total);
-
-                Ok(())
-            }
+            Ok(())
         })
         .buffer_unordered(concurrency)
         .collect()
         .await;
 
-    for result in results {
-        result?;
-    }
-
-    Ok(())
+    results.into_iter().collect()
 }
 
 fn build_download_ranges(size_bytes: u64, chunk_size_bytes: u64) -> Vec<(u64, u64)> {
@@ -344,15 +295,13 @@ fn build_download_ranges(size_bytes: u64, chunk_size_bytes: u64) -> Vec<(u64, u6
 }
 
 fn download_concurrency(size_bytes: u64) -> usize {
-    let target = if size_bytes >= 1024 * 1024 * 1024 {
+    if size_bytes >= 1024 * 1024 * 1024 {
         MAX_CONCURRENT_DOWNLOADS
     } else if size_bytes >= 256 * 1024 * 1024 {
         6
     } else {
         4
-    };
-
-    target.clamp(1, MAX_CONCURRENT_DOWNLOADS)
+    }
 }
 
 async fn download_range(
@@ -363,71 +312,50 @@ async fn download_range(
     end: u64,
 ) -> Result<u64> {
     let expected_size = end - start + 1;
+    let download_error = |reason: String| CfmpegError::Download {
+        filename: remote_output.filename.clone(),
+        reason,
+    };
 
-    for attempt in 0..DOWNLOAD_MAX_RETRIES {
+    let response = retry_with_backoff(|| async {
         let response = client
             .get(&remote_output.download_url)
             .header("Range", format!("bytes={start}-{end}"))
             .send()
-            .await;
+            .await
+            .map_err(|error| download_error(error.to_string()))?;
 
-        match response {
-            Ok(response) if response.status().as_u16() == 206 => {
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|error| CfmpegError::Download {
-                        filename: remote_output.filename.clone(),
-                        reason: error.to_string(),
-                    })?;
-
-                if bytes.len() as u64 != expected_size {
-                    return Err(CfmpegError::Download {
-                        filename: remote_output.filename.clone(),
-                        reason: format!(
-                            "range {start}-{end} returned {} bytes, expected {expected_size}",
-                            bytes.len()
-                        ),
-                    });
-                }
-
-                let mut file = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(target_path)
-                    .await?;
-                file.seek(std::io::SeekFrom::Start(start)).await?;
-                file.write_all(&bytes).await?;
-
-                return Ok(expected_size);
-            }
-            Ok(response) => {
-                if attempt == DOWNLOAD_MAX_RETRIES - 1 {
-                    return Err(CfmpegError::Download {
-                        filename: remote_output.filename.clone(),
-                        reason: format!(
-                            "range {start}-{end} failed with status {}",
-                            response.status()
-                        ),
-                    });
-                }
-            }
-            Err(error) => {
-                if attempt == DOWNLOAD_MAX_RETRIES - 1 {
-                    return Err(CfmpegError::Download {
-                        filename: remote_output.filename.clone(),
-                        reason: error.to_string(),
-                    });
-                }
-            }
+        if response.status().as_u16() != 206 {
+            return Err(download_error(format!(
+                "range {start}-{end} failed with status {}",
+                response.status()
+            )));
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(500 * 2u64.pow(attempt))).await;
+        Ok(response)
+    })
+    .await?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| download_error(error.to_string()))?;
+
+    if bytes.len() as u64 != expected_size {
+        return Err(download_error(format!(
+            "range {start}-{end} returned {} bytes, expected {expected_size}",
+            bytes.len()
+        )));
     }
 
-    Err(CfmpegError::Download {
-        filename: remote_output.filename.clone(),
-        reason: format!("range {start}-{end} failed after retries"),
-    })
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(target_path)
+        .await?;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    file.write_all(&bytes).await?;
+
+    Ok(expected_size)
 }
 
 fn format_output_urls(remote_outputs: &[OutputFile]) -> Vec<String> {
@@ -438,23 +366,19 @@ fn format_output_urls(remote_outputs: &[OutputFile]) -> Vec<String> {
 }
 
 async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path) -> Result<()> {
-    if batch_paths.is_empty() {
-        return Err(CfmpegError::Protocol(
-            "cannot concatenate an empty batch list".to_string(),
-        ));
-    }
-
     if let Some(parent) = target_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let manifest_path =
-        std::env::temp_dir().join(format!("cfmpeg-output-batches-{}.txt", Uuid::new_v4()));
+    let manifest_file = tempfile::Builder::new()
+        .prefix("cfmpeg-output-batches-")
+        .suffix(".txt")
+        .tempfile()?;
     let manifest = batch_paths
         .iter()
         .map(|path| format!("file '{}'\n", path.display()))
         .collect::<String>();
-    tokio::fs::write(&manifest_path, manifest).await?;
+    tokio::fs::write(manifest_file.path(), manifest).await?;
 
     let ffmpeg = ffmpeg_binary()?;
     let output = Command::new(ffmpeg)
@@ -468,7 +392,7 @@ async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path)
         .arg("-safe")
         .arg("0")
         .arg("-i")
-        .arg(&manifest_path)
+        .arg(manifest_file.path())
         .arg("-c")
         .arg("copy")
         .arg(target_path)
@@ -476,8 +400,6 @@ async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path)
         .stderr(Stdio::piped())
         .output()
         .await?;
-
-    let _ = tokio::fs::remove_file(&manifest_path).await;
 
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();

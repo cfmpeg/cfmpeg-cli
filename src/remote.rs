@@ -1,10 +1,10 @@
 use crate::error::{CfmpegError, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub const PROFILE_BALANCED: &str = "balanced";
 pub const PROFILE_HIGHCPU: &str = "highcpu";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RemoteExecutionOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
@@ -34,10 +34,6 @@ impl RemoteExecutionOptions {
             timeout_seconds: self.timeout_seconds.or(defaults.timeout_seconds),
             strict_remote: self.strict_remote,
         }
-    }
-
-    pub fn requires_strict_remote(&self) -> bool {
-        self.strict_remote
     }
 }
 
@@ -71,86 +67,74 @@ pub fn parse_cpu_cores(value: &str) -> Result<u16> {
 }
 
 pub fn parse_memory_mb(value: &str) -> Result<u32> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(CfmpegError::ParseError(
-            "invalid value for --cf-memory: expected a size like 4096, 4g, or 512m".to_string(),
-        ));
-    }
-
-    let split_at = trimmed
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (number_part, unit_part) = trimmed.split_at(split_at);
-    let number = number_part.parse::<u32>().map_err(|_| {
-        CfmpegError::ParseError(format!(
-            "invalid value for --cf-memory: {value} (expected a size like 4096, 4g, or 512m)"
-        ))
-    })?;
-
-    if number == 0 {
-        return Err(CfmpegError::ParseError(
-            "invalid value for --cf-memory: expected a positive size".to_string(),
-        ));
-    }
-
-    let multiplier = match unit_part.to_ascii_lowercase().as_str() {
-        "" | "m" | "mb" | "mib" => 1,
-        "g" | "gb" | "gib" => 1024,
-        _ => {
-            return Err(CfmpegError::ParseError(format!(
-                "invalid value for --cf-memory: {value} (expected a size like 4096, 4g, or 512m)"
-            )))
-        }
-    };
-
-    number.checked_mul(multiplier).ok_or_else(|| {
-        CfmpegError::ParseError(format!(
-            "invalid value for --cf-memory: {value} is too large"
-        ))
-    })
+    parse_scaled_u32(
+        value,
+        "--cf-memory",
+        "size",
+        "4096, 4g, or 512m",
+        &[
+            ("", 1),
+            ("m", 1),
+            ("mb", 1),
+            ("mib", 1),
+            ("g", 1024),
+            ("gb", 1024),
+            ("gib", 1024),
+        ],
+    )
 }
 
 pub fn parse_timeout_seconds(value: &str) -> Result<u32> {
+    parse_scaled_u32(
+        value,
+        "--cf-timeout",
+        "duration",
+        "3600, 90s, 15m, or 2h",
+        &[("", 1), ("s", 1), ("m", 60), ("h", 3600)],
+    )
+}
+
+fn parse_scaled_u32(
+    value: &str,
+    flag: &str,
+    kind: &str,
+    examples: &str,
+    units: &[(&str, u32)],
+) -> Result<u32> {
+    let invalid = || {
+        CfmpegError::ParseError(format!(
+            "invalid value for {flag}: {value} (expected a {kind} like {examples})"
+        ))
+    };
+
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(CfmpegError::ParseError(
-            "invalid value for --cf-timeout: expected a duration like 3600, 90s, 15m, or 2h"
-                .to_string(),
-        ));
+        return Err(CfmpegError::ParseError(format!(
+            "invalid value for {flag}: expected a {kind} like {examples}"
+        )));
     }
 
     let split_at = trimmed
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(trimmed.len());
     let (number_part, unit_part) = trimmed.split_at(split_at);
-    let number = number_part.parse::<u32>().map_err(|_| {
-        CfmpegError::ParseError(format!(
-            "invalid value for --cf-timeout: {value} (expected a duration like 3600, 90s, 15m, or 2h)"
-        ))
-    })?;
+    let number = number_part.parse::<u32>().map_err(|_| invalid())?;
 
     if number == 0 {
-        return Err(CfmpegError::ParseError(
-            "invalid value for --cf-timeout: expected a positive duration".to_string(),
-        ));
+        return Err(CfmpegError::ParseError(format!(
+            "invalid value for {flag}: expected a positive {kind}"
+        )));
     }
 
-    let multiplier = match unit_part.to_ascii_lowercase().as_str() {
-        "" | "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        _ => {
-            return Err(CfmpegError::ParseError(format!(
-                "invalid value for --cf-timeout: {value} (expected a duration like 3600, 90s, 15m, or 2h)"
-            )))
-        }
-    };
+    let unit = unit_part.to_ascii_lowercase();
+    let multiplier = units
+        .iter()
+        .find(|(name, _)| *name == unit)
+        .map(|(_, multiplier)| *multiplier)
+        .ok_or_else(invalid)?;
 
     number.checked_mul(multiplier).ok_or_else(|| {
-        CfmpegError::ParseError(format!(
-            "invalid value for --cf-timeout: {value} is too large"
-        ))
+        CfmpegError::ParseError(format!("invalid value for {flag}: {value} is too large"))
     })
 }
 
@@ -170,31 +154,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_remote_requests_require_remote_execution() {
-        assert!(RemoteExecutionOptions {
-            cpu: Some(8),
-            strict_remote: true,
-            ..RemoteExecutionOptions::default()
-        }
-        .requires_strict_remote());
-    }
-
-    #[test]
-    fn strict_remote_without_resource_overrides_still_requires_remote_execution() {
-        assert!(RemoteExecutionOptions {
-            strict_remote: true,
-            ..RemoteExecutionOptions::default()
-        }
-        .requires_strict_remote());
-    }
-
-    #[test]
     fn default_remote_preferences_do_not_require_remote_execution() {
         let merged = RemoteExecutionOptions::default().merge_defaults(&RemoteExecutionOptions {
             timeout_seconds: Some(3600),
             ..RemoteExecutionOptions::default()
         });
 
-        assert!(!merged.requires_strict_remote());
+        assert!(!merged.strict_remote);
     }
 }

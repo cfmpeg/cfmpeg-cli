@@ -128,35 +128,13 @@ const VALUED_OPTION_FAMILIES: &[&str] = &[
     "-vsync",
 ];
 
-const FLAG_OPTIONS: &[&str] = &[
-    "-accurate_seek",
-    "-an",
-    "-benchmark",
-    "-copyts",
-    "-copy_unknown",
-    "-dn",
-    "-dump",
-    "-hide_banner",
-    "-hex",
-    "-ignore_unknown",
-    "-n",
-    "-noaccurate_seek",
-    "-nostats",
-    "-nostdin",
-    "-re",
-    "-shortest",
-    "-sn",
-    "-vn",
-    "-y",
-];
-
 pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     let mut sandbox_args = Vec::new();
     let mut input_counter = 0usize;
     let mut output_counter = 0usize;
-    let mut pending_input_format: Option<String> = None;
+    let mut concat_input_pending = false;
 
     let mut index = 0usize;
     while index < args.len() {
@@ -170,7 +148,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
                 CfmpegError::ParseError("-i flag requires an input path or URL".to_string())
             })?;
 
-            if pending_input_format.as_deref() == Some("concat") {
+            if concat_input_pending {
                 return Err(CfmpegError::ParseError(
                     "concat file lists are not supported for remote execution; use `--local` or expand the concat inputs before submitting the job".to_string(),
                 ));
@@ -182,7 +160,7 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
                 input_counter += 1;
             }
             inputs.push(input);
-            pending_input_format = None;
+            concat_input_pending = false;
             index += 1;
             continue;
         }
@@ -191,10 +169,8 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
             reject_remote_referenced_option(arg)?;
             sandbox_args.push(arg.clone());
 
-            if has_inline_option_value(arg) {
-                if let Some((_, value)) = arg.split_once('=') {
-                    observe_valued_option(arg, value, &mut pending_input_format);
-                }
+            if let Some((_, value)) = arg.split_once('=') {
+                observe_valued_option(arg, value, &mut concat_input_pending);
                 index += 1;
                 continue;
             }
@@ -204,14 +180,8 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
             let value = args
                 .get(index)
                 .ok_or_else(|| CfmpegError::ParseError(format!("{arg} requires an argument")))?;
-            observe_valued_option(arg, value, &mut pending_input_format);
+            observe_valued_option(arg, value, &mut concat_input_pending);
             sandbox_args.push(value.clone());
-            index += 1;
-            continue;
-        }
-
-        if is_flag_option(arg) {
-            sandbox_args.push(arg.clone());
             index += 1;
             continue;
         }
@@ -250,37 +220,6 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
         outputs,
         sandbox_args,
     })
-}
-
-#[cfg(test)]
-pub fn parse_concat_filelist(filelist_path: &Path) -> Result<Vec<PathBuf>> {
-    let contents = std::fs::read_to_string(filelist_path).map_err(|error| {
-        CfmpegError::ParseError(format!(
-            "failed to read concat file list {}: {error}",
-            filelist_path.display()
-        ))
-    })?;
-    let base_dir = filelist_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut paths = Vec::new();
-
-    for line in contents.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("file ") {
-            let path = rest.trim().trim_matches('\'').trim_matches('"');
-            let path = PathBuf::from(path);
-            let path = if path.is_relative() {
-                base_dir.join(path)
-            } else {
-                path
-            };
-            paths.push(path);
-        }
-    }
-
-    Ok(paths)
 }
 
 fn classify_input(path: &str) -> Result<Input> {
@@ -366,10 +305,6 @@ fn is_valued_option(arg: &str) -> bool {
         .any(|family| matches_option_family(arg, family))
 }
 
-fn is_flag_option(arg: &str) -> bool {
-    FLAG_OPTIONS.contains(&option_name(arg))
-}
-
 fn matches_option_family(arg: &str, family: &str) -> bool {
     let option = option_name(arg);
     option == family
@@ -382,14 +317,9 @@ fn option_name(arg: &str) -> &str {
     arg.split_once('=').map(|(option, _)| option).unwrap_or(arg)
 }
 
-fn has_inline_option_value(arg: &str) -> bool {
-    arg.split_once('=')
-        .is_some_and(|(option, _)| option.starts_with('-'))
-}
-
-fn observe_valued_option(arg: &str, value: &str, pending_input_format: &mut Option<String>) {
+fn observe_valued_option(arg: &str, value: &str, concat_input_pending: &mut bool) {
     if option_name(arg) == "-f" {
-        *pending_input_format = Some(value.to_ascii_lowercase());
+        *concat_input_pending = value.eq_ignore_ascii_case("concat");
     }
 }
 
@@ -407,7 +337,7 @@ fn reject_remote_referenced_option(arg: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_concat_filelist, parse_ffmpeg_args, Input};
+    use super::{parse_ffmpeg_args, Input};
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -484,22 +414,6 @@ mod tests {
         let error = parse_ffmpeg_args(&args).expect_err("missing input");
 
         assert!(error.to_string().contains("no input file detected"));
-    }
-
-    #[test]
-    fn parses_concat_file_lists_relative_to_the_list_path() {
-        let dir = temp_path("concat-dir");
-        fs::create_dir_all(&dir).expect("concat dir");
-
-        let list_path = dir.join("files.txt");
-        fs::write(&list_path, "file './one.mp4'\n# comment\nfile two.mp4\n").expect("concat file");
-
-        let paths = parse_concat_filelist(&list_path).expect("concat paths");
-
-        assert_eq!(paths, vec![dir.join("./one.mp4"), dir.join("two.mp4")]);
-
-        let _ = fs::remove_file(list_path);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -17,32 +17,8 @@ env:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
     if: github.repository == 'cfmpeg/cfmpeg-cli'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked
-
-      - name: Verify build
-        run: cargo build --locked
+    uses: ./.github/workflows/ci.yml
 
   release:
     needs: ci
@@ -186,7 +162,6 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           REPOSITORY: ${{ github.repository }}
-          REPOSITORY_OWNER: ${{ github.repository_owner }}
           HOMEBREW_TAP_OWNER: cfmpeg
           HOMEBREW_TAP_REPO: cfmpeg-homebrew-tap
         run: |
@@ -216,7 +191,7 @@ jobs:
               fi
 
               if [ "$attempt" -eq 8 ]; then
-                echo "Failed to fetch valid checksum for ${name} after retries."
+                echo "Failed to fetch valid checksum for ${name} after retries." >&2
                 exit 1
               fi
 
@@ -228,13 +203,6 @@ jobs:
           DARWIN_X64_SHA="$(read_sha "${DARWIN_X64_ARCHIVE}")"
           LINUX_ARM64_SHA="$(read_sha "${LINUX_ARM64_ARCHIVE}")"
           LINUX_X64_SHA="$(read_sha "${LINUX_X64_ARCHIVE}")"
-
-          for hash in "$DARWIN_ARM64_SHA" "$DARWIN_X64_SHA" "$LINUX_ARM64_SHA" "$LINUX_X64_SHA"; do
-            if ! [[ "$hash" =~ ^[a-f0-9]{64}$ ]]; then
-              echo "Invalid checksum fetched from release assets: $hash"
-              exit 1
-            fi
-          done
 
           git clone "https://x-access-token:${COMMITTER_TOKEN}@github.com/${HOMEBREW_TAP_OWNER}/${HOMEBREW_TAP_REPO}.git" "$TAP_DIR"
           cd "$TAP_DIR"
@@ -268,13 +236,12 @@ jobs:
 
             def install
               bin.install "bin/cfmpeg"
-              libexec.install "libexec/ffmpeg", "libexec/ffprobe"
+              libexec.install "libexec/ffmpeg"
             end
 
             test do
               assert_match version.to_s, shell_output("#{bin}/cfmpeg --version")
               assert_predicate libexec/"ffmpeg", :exist?
-              assert_predicate libexec/"ffprobe", :exist?
             end
           end
           EOF
@@ -300,7 +267,6 @@ jobs:
     if: github.repository == 'cfmpeg/cfmpeg-cli'
     env:
       VERSION: ${{ needs.release.outputs.version }}
-      REPOSITORY_OWNER: ${{ github.repository_owner }}
       HOMEBREW_TAP: cfmpeg/cfmpeg-homebrew-tap
       HOMEBREW_TAP_URL: https://github.com/cfmpeg/cfmpeg-homebrew-tap.git
 

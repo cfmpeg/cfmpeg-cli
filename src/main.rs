@@ -10,11 +10,13 @@ mod media_tools;
 mod parser;
 mod remote;
 mod stream;
+mod transfer;
 mod upload;
 
 use crate::api::{
-    ApiClient, CompleteIngestRequest, CompletedMultipartUpload, CreateJobRequest, JobInput,
-    OutputDeliveryRequest, StartJobRequest, UsageResponse,
+    ApiClient, CompleteIngestRequest, CompletedMultipartUpload, CreateJobRequest, IngestMode,
+    InputSource, JobInput, OutputDeliveryMode, OutputDeliveryRequest, StartJobRequest,
+    UsageResponse,
 };
 use crate::cli::{AuthAction, Command, ConfigAction};
 use crate::config::Config;
@@ -118,7 +120,7 @@ fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
         Some(ConfigAction::Show) => {
             let config = Config::load()?;
             let display_config = DisplayConfig {
-                api_key: config.api_key().map(|value| mask_secret(&value)),
+                api_key: config.api_key().map(|value| auth::mask_secret(&value)),
                 api_base: config.api_base(),
                 local_fallback: config.local_fallback,
                 remote_profile: config.remote_profile.clone(),
@@ -191,25 +193,21 @@ async fn run_encode(
         .iter()
         .map(|input| match input {
             Input::LocalFile { path, size } => JobInput {
-                filename: path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("input")
-                    .to_string(),
+                filename: transfer::file_name_or(path, "input"),
                 size_bytes: *size,
-                source: "local".to_string(),
+                source: InputSource::Local,
                 url: None,
             },
             Input::Special(value) => JobInput {
                 filename: value.clone(),
                 size_bytes: 0,
-                source: "special".to_string(),
+                source: InputSource::Special,
                 url: None,
             },
             Input::Url(url) => JobInput {
                 filename: url.clone(),
                 size_bytes: 0,
-                source: "url".to_string(),
+                source: InputSource::Url,
                 url: Some(url.clone()),
             },
         })
@@ -226,11 +224,11 @@ async fn run_encode(
         inputs: job_inputs,
         outputs,
         execution: effective_remote.clone(),
-        output_delivery: (!no_download && parsed.outputs.len() == 1).then(|| {
+        output_delivery: (!no_download && parsed.outputs.len() == 1).then_some(
             OutputDeliveryRequest {
-                mode: "progressive_batches".to_string(),
-            }
-        }),
+                mode: OutputDeliveryMode::ProgressiveBatches,
+            },
+        ),
     };
 
     let job = match api.create_job(&create_job_request).await {
@@ -258,157 +256,163 @@ async fn run_encode(
         })
         .collect();
 
-    if !job.ingest.is_direct_stream()
-        && !job.ingest.is_segmented_upload()
-        && job.uploads.len() < local_inputs.len()
-    {
-        return Err(CfmpegError::Protocol(
-            "api returned fewer upload targets than local inputs".to_string(),
-        ));
-    }
+    match job.ingest.mode {
+        IngestMode::DirectStream => {
+            let [input_path] = local_inputs.as_slice() else {
+                return Err(CfmpegError::Protocol(
+                    "direct stream jobs require exactly one local input".to_string(),
+                ));
+            };
 
-    if job.ingest.is_direct_stream() {
-        let [input_path] = local_inputs.as_slice() else {
-            return Err(CfmpegError::Protocol(
-                "direct stream jobs require exactly one local input".to_string(),
-            ));
-        };
-
-        eprintln!(
-            "  {} direct streaming enabled for this job",
-            style("->").cyan()
-        );
-        eprintln!();
-
-        let monitor_api = api.clone();
-        let monitor_http_client = http_client.clone();
-        let monitor_job_id = job.job_id.clone();
-        let monitor = tokio::spawn(async move {
-            job::wait_for_completion(
-                &monitor_api,
-                &monitor_http_client,
-                &monitor_job_id,
-                wait_timeout_seconds,
-            )
-            .await
-        });
-
-        if let Err(error) = stream::stream_input(&http_client, &job.ingest, input_path).await {
-            monitor.abort();
-            let _ = monitor.await;
-
-            return Err(error);
-        }
-
-        monitor.await.map_err(|error| {
-            CfmpegError::JobFailed(format!("job monitor task failed: {error}"))
-        })??;
-    } else if job.ingest.is_segmented_upload() {
-        let [input_path] = local_inputs.as_slice() else {
-            return Err(CfmpegError::Protocol(
-                "segmented upload jobs require exactly one local input".to_string(),
-            ));
-        };
-        let _upload_target_url = job.ingest.upload_target_url.as_deref().ok_or_else(|| {
-            CfmpegError::Protocol("segmented uploads require an upload target endpoint".to_string())
-        })?;
-
-        eprintln!(
-            "  {} segmented ingest enabled for this job",
-            style("->").cyan()
-        );
-        let use_progressive_batches = job.output_delivery.is_progressive_batches() && !no_download;
-
-        if use_progressive_batches {
             eprintln!(
-                "  {} progressive batch downloads enabled for this job",
+                "  {} direct streaming enabled for this job",
                 style("->").cyan()
             );
-        }
-        eprintln!();
+            eprintln!();
 
-        api.prepare_job(&job.job_id).await?;
-        let segment_count =
-            upload::upload_segmented_file(&api, &http_client, input_path, &job.job_id, &job.ingest)
-                .await?;
-        eprintln!();
-        api.complete_segmented_ingest(&job.job_id, &CompleteIngestRequest { segment_count })
-            .await?;
-
-        let stop_downloads = Arc::new(AtomicBool::new(false));
-        let progressive_download = if use_progressive_batches {
-            let download_api = api.clone();
-            let download_client = http_client.clone();
-            let job_id = job.job_id.clone();
-            let output_path = parsed.outputs[0].path.clone();
-            let stop = Arc::clone(&stop_downloads);
-
-            Some(tokio::spawn(async move {
-                download::download_progressive_batches(
-                    &download_api,
-                    &download_client,
-                    &job_id,
-                    &output_path,
-                    stop,
+            let monitor_api = api.clone();
+            let monitor_http_client = http_client.clone();
+            let monitor_job_id = job.job_id.clone();
+            let monitor = tokio::spawn(async move {
+                job::wait_for_completion(
+                    &monitor_api,
+                    &monitor_http_client,
+                    &monitor_job_id,
+                    wait_timeout_seconds,
                 )
                 .await
-            }))
-        } else {
-            None
-        };
+            });
 
-        let completion_result =
-            job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds).await;
-        stop_downloads.store(true, Ordering::Relaxed);
+            if let Err(error) = stream::stream_input(&http_client, &job.ingest, input_path).await {
+                monitor.abort();
+                let _ = monitor.await;
 
-        match (completion_result, progressive_download) {
-            (Ok(()), Some(handle)) => {
-                handle.await.map_err(|error| {
-                    CfmpegError::JobFailed(format!("progressive download task failed: {error}"))
-                })??;
-
-                eprintln!();
-                print_local_completion(&parsed.outputs);
-                return Ok(());
-            }
-            (Err(error), Some(handle)) => {
-                handle.abort();
-                let _ = handle.await;
                 return Err(error);
             }
-            (result, None) => {
-                result?;
+
+            monitor.await.map_err(|error| {
+                CfmpegError::JobFailed(format!("job monitor task failed: {error}"))
+            })??;
+        }
+        IngestMode::SegmentedUpload => {
+            let [input_path] = local_inputs.as_slice() else {
+                return Err(CfmpegError::Protocol(
+                    "segmented upload jobs require exactly one local input".to_string(),
+                ));
+            };
+
+            eprintln!(
+                "  {} segmented ingest enabled for this job",
+                style("->").cyan()
+            );
+            let use_progressive_batches =
+                job.output_delivery.mode == OutputDeliveryMode::ProgressiveBatches && !no_download;
+
+            if use_progressive_batches {
+                eprintln!(
+                    "  {} progressive batch downloads enabled for this job",
+                    style("->").cyan()
+                );
+            }
+            eprintln!();
+
+            api.prepare_job(&job.job_id).await?;
+            let segment_count = upload::upload_segmented_file(
+                &api,
+                &http_client,
+                input_path,
+                &job.job_id,
+                &job.ingest,
+            )
+            .await?;
+            eprintln!();
+            api.complete_segmented_ingest(&job.job_id, &CompleteIngestRequest { segment_count })
+                .await?;
+
+            let stop_downloads = Arc::new(AtomicBool::new(false));
+            let progressive_download = if use_progressive_batches {
+                let download_api = api.clone();
+                let download_client = http_client.clone();
+                let job_id = job.job_id.clone();
+                let output_path = parsed.outputs[0].path.clone();
+                let stop = Arc::clone(&stop_downloads);
+
+                Some(tokio::spawn(async move {
+                    download::download_progressive_batches(
+                        &download_api,
+                        &download_client,
+                        &job_id,
+                        &output_path,
+                        stop,
+                    )
+                    .await
+                }))
+            } else {
+                None
+            };
+
+            let completion_result =
+                job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds)
+                    .await;
+            stop_downloads.store(true, Ordering::Relaxed);
+
+            match (completion_result, progressive_download) {
+                (Ok(()), Some(handle)) => {
+                    handle.await.map_err(|error| {
+                        CfmpegError::JobFailed(format!("progressive download task failed: {error}"))
+                    })??;
+
+                    eprintln!();
+                    print_local_completion(&parsed.outputs);
+                    return Ok(());
+                }
+                (Err(error), Some(handle)) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    return Err(error);
+                }
+                (result, None) => {
+                    result?;
+                }
             }
         }
-    } else {
-        if !local_inputs.is_empty() {
-            if let Err(error) = api.prepare_job(&job.job_id).await {
-                eprintln!(
-                    "  warning: remote worker warmup failed; continuing with the normal start path."
-                );
-                eprintln!("  note: {error}");
+        IngestMode::Durable => {
+            if job.uploads.len() < local_inputs.len() {
+                return Err(CfmpegError::Protocol(
+                    "api returned fewer upload targets than local inputs".to_string(),
+                ));
+            }
+
+            let mut multipart_uploads = Vec::new();
+
+            if !local_inputs.is_empty() {
+                if let Err(error) = api.prepare_job(&job.job_id).await {
+                    eprintln!(
+                        "  warning: remote worker warmup failed; continuing with the normal start path."
+                    );
+                    eprintln!("  note: {error}");
+                    eprintln!();
+                }
+
+                eprintln!();
+
+                for (path, target) in local_inputs.iter().zip(&job.uploads) {
+                    let parts = upload::upload_file(&http_client, path, target).await?;
+
+                    if !parts.is_empty() {
+                        multipart_uploads.push(CompletedMultipartUpload {
+                            file_id: target.file_id,
+                            parts,
+                        });
+                    }
+                }
                 eprintln!();
             }
 
-            eprintln!();
-            let mut multipart_uploads = Vec::new();
-
-            for (index, path) in local_inputs.iter().enumerate() {
-                let upload_result =
-                    upload::upload_file(&http_client, path, &job.uploads[index]).await?;
-
-                if !upload_result.multipart_parts.is_empty() {
-                    multipart_uploads.push(CompletedMultipartUpload {
-                        file_id: job.uploads[index].file_id,
-                        parts: upload_result.multipart_parts,
-                    });
-                }
-            }
-            eprintln!();
-
-            let start_request = StartJobRequest { multipart_uploads };
-
-            if let Err(error) = api.start_job(&job.job_id, &start_request).await {
+            if let Err(error) = api
+                .start_job(&job.job_id, &StartJobRequest { multipart_uploads })
+                .await
+            {
                 if let Some(result) =
                     maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
                 {
@@ -417,20 +421,9 @@ async fn run_encode(
 
                 return Err(error);
             }
-        } else if let Err(error) = api
-            .start_job(&job.job_id, &StartJobRequest::default())
-            .await
-        {
-            if let Some(result) =
-                maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
-            {
-                return result;
-            }
 
-            return Err(error);
+            job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds).await?;
         }
-
-        job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds).await?;
     }
 
     let outputs = api.get_outputs(&job.job_id).await?;
@@ -479,7 +472,7 @@ fn format_usage_report(usage: &UsageResponse) -> Vec<String> {
         ),
         format!(
             "  Total cost:   {}",
-            format_money_from_millicents(usage.total_cost_millicents(), &usage.currency)
+            format_money_from_millicents(usage.total_cost_millicents, &usage.currency)
         ),
     ]
 }
@@ -548,9 +541,7 @@ async fn maybe_fallback_to_local(
             eprintln!("  top up at {}", config.dashboard_billing_url());
         }
         _ => {
-            eprintln!(
-                "  warning: remote job execution is not enabled yet; falling back to local ffmpeg."
-            );
+            eprintln!("  warning: {error}; falling back to local ffmpeg.");
         }
     }
 
@@ -567,7 +558,7 @@ fn allows_local_fallback(
     config: &Config,
     effective_remote: &remote::RemoteExecutionOptions,
 ) -> bool {
-    config.local_fallback && !effective_remote.requires_strict_remote()
+    config.local_fallback && !effective_remote.strict_remote
 }
 
 fn remote_wait_timeout_seconds(effective_remote: &remote::RemoteExecutionOptions) -> u64 {
@@ -612,14 +603,6 @@ fn currency_symbol(currency: &str) -> &str {
         "usd" => "$",
         _ => "",
     }
-}
-
-fn mask_secret(secret: &str) -> String {
-    if secret.len() <= 8 {
-        return "*".repeat(secret.len());
-    }
-
-    format!("{}...{}", &secret[..4], &secret[secret.len() - 4..])
 }
 
 #[derive(Serialize)]
@@ -667,8 +650,6 @@ mod tests {
             period_start: "2026-06-01".to_string(),
             period_end: "2026-06-30".to_string(),
             cpu_minutes: 0.5,
-            gpu_minutes: 0.0,
-            total_cost_cents: 0,
             total_cost_millicents: 369,
             jobs_count: 3,
             balance_millicents: 4_698_347,

@@ -1,4 +1,4 @@
-use crate::api::{parse_error_response, JobIngest};
+use crate::api::{error_from_response, JobIngest, StreamStrategy};
 use crate::error::{CfmpegError, Result};
 use crate::media_tools;
 use reqwest::header::CONTENT_TYPE;
@@ -19,20 +19,20 @@ pub async fn stream_input(client: &Client, ingest: &JobIngest, input_path: &Path
     let input_format = ingest.input_format.as_deref().ok_or_else(|| {
         CfmpegError::Protocol("direct stream jobs require an input_format".to_string())
     })?;
-    let stream_strategy = ingest.stream_strategy.as_deref().ok_or_else(|| {
+    let stream_strategy = ingest.stream_strategy.ok_or_else(|| {
         CfmpegError::Protocol("direct stream jobs require a stream_strategy".to_string())
     })?;
 
     let content_type = stream_content_type(input_format);
 
     match stream_strategy {
-        "passthrough" => {
+        StreamStrategy::Passthrough => {
             let file = tokio::fs::File::open(input_path).await?;
             let body = reqwest::Body::wrap_stream(ReaderStream::new(file));
 
             handle_stream_response(client, stream_url, claim_url, content_type, body).await
         }
-        "copy_remux" => {
+        StreamStrategy::CopyRemux => {
             let ffmpeg_binary = media_tools::ffmpeg_binary()?;
             let mut child = Command::new(ffmpeg_binary)
                 .arg("-hide_banner")
@@ -50,12 +50,8 @@ pub async fn stream_input(client: &Client, ingest: &JobIngest, input_path: &Path
                 .stderr(Stdio::piped())
                 .spawn()?;
 
-            let stdout = child.stdout.take().ok_or_else(|| {
-                CfmpegError::Protocol("ffmpeg remux process did not expose stdout".to_string())
-            })?;
-            let stderr = child.stderr.take().ok_or_else(|| {
-                CfmpegError::Protocol("ffmpeg remux process did not expose stderr".to_string())
-            })?;
+            let stdout = child.stdout.take().expect("remux stdout is piped");
+            let stderr = child.stderr.take().expect("remux stderr is piped");
 
             let stderr_task = tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
@@ -89,9 +85,9 @@ pub async fn stream_input(client: &Client, ingest: &JobIngest, input_path: &Path
 
             response
         }
-        _ => Err(CfmpegError::Protocol(format!(
-            "unsupported direct stream strategy: {stream_strategy}"
-        ))),
+        StreamStrategy::Unknown => Err(CfmpegError::Protocol(
+            "unsupported direct stream strategy".to_string(),
+        )),
     }
 }
 
@@ -114,20 +110,7 @@ async fn handle_stream_response(
         return Ok(());
     }
 
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let body = response.text().await.unwrap_or_default();
-    let (message, code) = parse_error_response(status.as_u16(), content_type.as_deref(), &body);
-
-    Err(CfmpegError::Api {
-        status: status.as_u16(),
-        code,
-        message,
-    })
+    Err(error_from_response(response).await)
 }
 
 fn stream_content_type(input_format: &str) -> &str {

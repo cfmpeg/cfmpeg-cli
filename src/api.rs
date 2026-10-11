@@ -2,9 +2,8 @@ use crate::config::Config;
 use crate::error::{describe_http_error, CfmpegError, Result};
 use crate::remote::RemoteExecutionOptions;
 use reqwest::header::CONTENT_TYPE;
-use reqwest::Client;
-use reqwest::Url;
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use reqwest::{Client, RequestBuilder, Response, Url};
+use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -32,7 +31,7 @@ pub struct CreateJobRequest {
 pub struct JobInput {
     pub filename: String,
     pub size_bytes: u64,
-    pub source: String,
+    pub source: InputSource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
@@ -48,10 +47,18 @@ pub struct CreateJobResponse {
     pub output_delivery: JobOutputDelivery,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputSource {
+    Local,
+    Special,
+    Url,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct JobIngest {
-    #[serde(default = "default_ingest_mode")]
-    pub mode: String,
+    #[serde(default)]
+    pub mode: IngestMode,
     #[serde(default)]
     pub stream_url: Option<String>,
     #[serde(default)]
@@ -59,60 +66,48 @@ pub struct JobIngest {
     #[serde(default)]
     pub input_format: Option<String>,
     #[serde(default)]
-    pub stream_strategy: Option<String>,
+    pub stream_strategy: Option<StreamStrategy>,
     #[serde(default)]
     pub segment_duration_seconds: Option<u64>,
-    #[serde(default)]
-    pub upload_target_url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestMode {
+    DirectStream,
+    SegmentedUpload,
+    #[default]
+    #[serde(other)]
+    Durable,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamStrategy {
+    Passthrough,
+    CopyRemux,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputDeliveryMode {
+    ProgressiveBatches,
+    #[default]
+    #[serde(other)]
+    FinalArtifact,
 }
 
 #[derive(Debug, Serialize)]
 pub struct OutputDeliveryRequest {
-    pub mode: String,
+    pub mode: OutputDeliveryMode,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct JobOutputDelivery {
-    #[serde(default = "default_output_delivery_mode")]
-    pub mode: String,
-}
-
-impl Default for JobOutputDelivery {
-    fn default() -> Self {
-        Self {
-            mode: default_output_delivery_mode(),
-        }
-    }
-}
-
-impl JobOutputDelivery {
-    pub fn is_progressive_batches(&self) -> bool {
-        self.mode == "progressive_batches"
-    }
-}
-
-impl JobIngest {
-    pub fn is_direct_stream(&self) -> bool {
-        self.mode == "direct_stream"
-    }
-
-    pub fn is_segmented_upload(&self) -> bool {
-        self.mode == "segmented_upload"
-    }
-}
-
-impl Default for JobIngest {
-    fn default() -> Self {
-        Self {
-            mode: default_ingest_mode(),
-            stream_url: None,
-            claim_url: None,
-            input_format: None,
-            stream_strategy: None,
-            segment_duration_seconds: None,
-            upload_target_url: None,
-        }
-    }
+    #[serde(default)]
+    pub mode: OutputDeliveryMode,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -134,11 +129,19 @@ pub struct UploadTarget {
     pub file_id: u64,
     pub filename: String,
     pub upload_url: String,
-    pub method: String,
+    pub method: UploadMethod,
     pub part_size: u64,
     pub part_urls: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_headers")]
     pub headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadMethod {
+    Multipart,
+    #[serde(other)]
+    Direct,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -218,14 +221,6 @@ where
     deserializer.deserialize_any(HeadersVisitor)
 }
 
-fn default_ingest_mode() -> String {
-    "durable".to_string()
-}
-
-fn default_output_delivery_mode() -> String {
-    "final_artifact".to_string()
-}
-
 #[derive(Debug, Deserialize)]
 pub struct JobStatus {
     pub job_id: String,
@@ -248,12 +243,340 @@ pub enum JobState {
     Cancelled,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct JobProgress {
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub frame: Option<u64>,
+    #[serde(default)]
+    pub fps: Option<f64>,
+    #[serde(default)]
+    pub percent: Option<f64>,
+    #[serde(default)]
+    pub size_kb: Option<u64>,
+    #[serde(default)]
+    pub speed: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JobOutputResponse {
+    #[serde(default)]
+    pub delivery_mode: OutputDeliveryMode,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub outputs: Vec<OutputFile>,
+    #[serde(default)]
+    pub batches: Vec<OutputBatch>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputFile {
+    pub filename: String,
+    pub download_url: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OutputBatch {
+    pub index: u32,
+    pub filename: String,
+    pub download_url: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UsageResponse {
+    pub period_start: String,
+    pub period_end: String,
+    pub cpu_minutes: f64,
+    #[serde(default)]
+    pub total_cost_millicents: i64,
+    pub jobs_count: u64,
+    #[serde(default)]
+    pub balance_millicents: i64,
+    #[serde(default = "default_currency")]
+    pub currency: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiErrorResponse {
+    pub error: String,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+fn parse_error_response(
+    status_code: u16,
+    content_type: Option<&str>,
+    body: &str,
+) -> (String, Option<String>) {
+    if let Ok(parsed) = serde_json::from_str::<ApiErrorResponse>(body) {
+        return (parsed.error, parsed.code);
+    }
+
+    let trimmed = body.trim();
+    let is_html = content_type.is_some_and(|value| {
+        value.contains("text/html") || value.contains("application/xhtml+xml")
+    }) || trimmed.starts_with("<!DOCTYPE html")
+        || trimmed.starts_with("<html");
+
+    if is_html {
+        let message = if status_code >= 500 {
+            "server returned an HTML error page instead of JSON".to_string()
+        } else {
+            "api returned an unexpected HTML response".to_string()
+        };
+
+        return (message, Some("unexpected_html_response".to_string()));
+    }
+
+    let single_line = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("request failed");
+
+    (truncate_error_message(single_line, 240), None)
+}
+
+fn truncate_error_message(message: &str, max_len: usize) -> String {
+    if message.chars().count() <= max_len {
+        return message.to_string();
+    }
+
+    message.chars().take(max_len).collect::<String>() + "..."
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProgressEvent {
+    #[serde(flatten)]
+    pub progress: JobProgress,
+    pub status: JobState,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+const NO_BODY: Option<&()> = None;
+
+impl ApiClient {
+    pub fn from_config(config: &Config) -> Result<Self> {
+        let api_key = config.require_api_key()?;
+        let base_url = config.api_base();
+        let client = Client::builder()
+            .user_agent(format!("cfmpeg/{}", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
+        Ok(Self {
+            client,
+            base_url,
+            api_key,
+        })
+    }
+
+    pub async fn create_job(&self, request: &CreateJobRequest) -> Result<CreateJobResponse> {
+        let response = self
+            .post_request("/jobs", Some(request))
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_connect() || error.is_timeout() {
+                    CfmpegError::ApiUnreachable(format!(
+                        "{} ({})",
+                        self.base_url,
+                        describe_http_error(&error)
+                    ))
+                } else {
+                    CfmpegError::from(error)
+                }
+            })?;
+
+        handle_response(response).await
+    }
+
+    pub async fn start_job(&self, job_id: &str, request: &StartJobRequest) -> Result<JobStatus> {
+        self.post(&format!("/jobs/{job_id}/start"), Some(request))
+            .await
+    }
+
+    pub async fn prepare_job(&self, job_id: &str) -> Result<JobStatus> {
+        self.post(&format!("/jobs/{job_id}/prepare"), NO_BODY).await
+    }
+
+    pub async fn cancel_job(&self, job_id: &str) -> Result<JobStatus> {
+        self.post(&format!("/jobs/{job_id}/cancel"), NO_BODY).await
+    }
+
+    pub async fn request_segment_upload_targets(
+        &self,
+        job_id: &str,
+        request: &SegmentUploadTargetsRequest,
+    ) -> Result<Vec<SegmentUploadTarget>> {
+        let payload: SegmentUploadTargetsResponse = self
+            .post(
+                &format!("/jobs/{job_id}/ingest/segments/upload-targets"),
+                Some(request),
+            )
+            .await?;
+
+        Ok(payload.targets)
+    }
+
+    pub async fn complete_segmented_ingest(
+        &self,
+        job_id: &str,
+        request: &CompleteIngestRequest,
+    ) -> Result<JobStatus> {
+        self.post(&format!("/jobs/{job_id}/ingest/complete"), Some(request))
+            .await
+    }
+
+    pub async fn report_segmented_ingest_progress(
+        &self,
+        job_id: &str,
+        request: &IngestProgressRequest,
+    ) -> Result<JobStatus> {
+        self.post(&format!("/jobs/{job_id}/ingest/progress"), Some(request))
+            .await
+    }
+
+    pub async fn get_job_status(&self, job_id: &str) -> Result<JobStatus> {
+        self.get(&format!("/jobs/{job_id}")).await
+    }
+
+    pub fn stream_url(&self, job_id: &str) -> String {
+        format!("{}/jobs/{job_id}/stream", self.base_url)
+    }
+
+    pub fn should_stream_progress(&self) -> bool {
+        let Ok(url) = Url::parse(&self.base_url) else {
+            return true;
+        };
+
+        let Some(host) = url.host_str() else {
+            return true;
+        };
+
+        !matches!(host, "127.0.0.1" | "localhost" | "::1")
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    pub async fn get_outputs(&self, job_id: &str) -> Result<JobOutputResponse> {
+        self.get(&format!("/jobs/{job_id}/output")).await
+    }
+
+    pub async fn get_output_batches(&self, job_id: &str) -> Result<JobOutputResponse> {
+        self.get(&format!("/jobs/{job_id}/output-batches")).await
+    }
+
+    pub async fn get_usage(&self) -> Result<UsageResponse> {
+        self.get("/usage").await
+    }
+
+    pub async fn health_check(&self) -> Result<()> {
+        let response = self
+            .client
+            .get(format!("{}/health", self.base_url))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|error| {
+                CfmpegError::ApiUnreachable(format!(
+                    "{} ({})",
+                    self.base_url,
+                    describe_http_error(&error)
+                ))
+            })?;
+
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(CfmpegError::ApiUnreachable(format!(
+                "{} (health returned {})",
+                self.base_url,
+                response.status()
+            )))
+        }
+    }
+
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let response = self
+            .client
+            .get(format!("{}{path}", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+
+        handle_response(response).await
+    }
+
+    async fn post<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<T> {
+        let response = self.post_request(path, body).send().await?;
+
+        handle_response(response).await
+    }
+
+    fn post_request<B: Serialize>(&self, path: &str, body: Option<&B>) -> RequestBuilder {
+        let request = self
+            .client
+            .post(format!("{}{path}", self.base_url))
+            .bearer_auth(&self.api_key);
+
+        match body {
+            Some(body) => request.json(body),
+            None => request,
+        }
+    }
+}
+
+async fn handle_response<T: DeserializeOwned>(response: Response) -> Result<T> {
+    if response.status().is_success() {
+        return response.json::<T>().await.map_err(CfmpegError::from);
+    }
+
+    Err(error_from_response(response).await)
+}
+
+pub(crate) async fn error_from_response(response: Response) -> CfmpegError {
+    let status_code = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response.text().await.unwrap_or_default();
+    let (message, code) = parse_error_response(status_code, content_type.as_deref(), &body);
+
+    CfmpegError::Api {
+        status: status_code,
+        code,
+        message,
+    }
+}
+
+fn default_currency() -> String {
+    "usd".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_error_response, ApiClient, CompletedMultipartPart, CreateJobResponse,
-        JobOutputResponse, JobState, JobStatus, ProgressEvent, StartJobRequest, UploadTarget,
-        UsageResponse,
+        parse_error_response, ApiClient, CompletedMultipartPart, CreateJobResponse, IngestMode,
+        JobOutputResponse, JobState, JobStatus, OutputDeliveryMode, ProgressEvent, StartJobRequest,
+        StreamStrategy, UploadMethod, UploadTarget, UsageResponse,
     };
 
     #[test]
@@ -287,6 +610,7 @@ mod tests {
         .expect("upload target should deserialize");
 
         assert_eq!(target.file_id, 42);
+        assert_eq!(target.method, UploadMethod::Direct);
         assert_eq!(
             target.headers.get("x-test-header").map(String::as_str),
             Some("signed-value")
@@ -385,8 +709,7 @@ mod tests {
         )
         .expect("create job response should deserialize");
 
-        assert_eq!(response.ingest.mode, "durable");
-        assert!(!response.ingest.is_direct_stream());
+        assert_eq!(response.ingest.mode, IngestMode::Durable);
     }
 
     #[test]
@@ -406,7 +729,11 @@ mod tests {
         )
         .expect("direct stream response should deserialize");
 
-        assert!(response.ingest.is_direct_stream());
+        assert_eq!(response.ingest.mode, IngestMode::DirectStream);
+        assert_eq!(
+            response.ingest.stream_strategy,
+            Some(StreamStrategy::CopyRemux)
+        );
         assert_eq!(
             response.ingest.stream_url.as_deref(),
             Some("https://worker.example.test/stream-highcpu")
@@ -422,19 +749,14 @@ mod tests {
                 "uploads": [],
                 "ingest": {
                     "mode": "segmented_upload",
-                    "segment_duration_seconds": 90,
-                    "upload_target_url": "https://api.example.test/v1/jobs/job_123/ingest/segments/0/upload-target"
+                    "segment_duration_seconds": 90
                 }
             }"#,
         )
         .expect("segmented ingest response should deserialize");
 
-        assert!(response.ingest.is_segmented_upload());
+        assert_eq!(response.ingest.mode, IngestMode::SegmentedUpload);
         assert_eq!(response.ingest.segment_duration_seconds, Some(90));
-        assert_eq!(
-            response.ingest.upload_target_url.as_deref(),
-            Some("https://api.example.test/v1/jobs/job_123/ingest/segments/0/upload-target")
-        );
     }
 
     #[test]
@@ -510,7 +832,7 @@ mod tests {
         )
         .expect("final output response should deserialize");
 
-        assert!(!response.is_progressive_batches());
+        assert_eq!(response.delivery_mode, OutputDeliveryMode::FinalArtifact);
         assert!(response.complete);
         assert_eq!(response.outputs.len(), 1);
         assert!(response.batches.is_empty());
@@ -533,7 +855,10 @@ mod tests {
         )
         .expect("progressive output response should deserialize");
 
-        assert!(response.is_progressive_batches());
+        assert_eq!(
+            response.delivery_mode,
+            OutputDeliveryMode::ProgressiveBatches
+        );
         assert!(!response.complete);
         assert!(response.outputs.is_empty());
         assert_eq!(response.batches.len(), 1);
@@ -558,392 +883,6 @@ mod tests {
         )
         .expect("usage response should deserialize");
 
-        assert_eq!(response.total_cost_millicents(), 369);
+        assert_eq!(response.total_cost_millicents, 369);
     }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct JobProgress {
-    #[serde(default)]
-    pub detail: Option<String>,
-    #[serde(default)]
-    pub frame: Option<u64>,
-    #[serde(default)]
-    pub fps: Option<f64>,
-    #[serde(default)]
-    pub percent: Option<f64>,
-    #[serde(default)]
-    pub size_kb: Option<u64>,
-    #[serde(default)]
-    pub speed: Option<String>,
-    #[serde(default)]
-    pub stage: Option<String>,
-    #[serde(default)]
-    pub time: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct JobOutputResponse {
-    #[serde(default = "default_output_delivery_mode")]
-    pub delivery_mode: String,
-    #[serde(default)]
-    pub complete: bool,
-    #[serde(default)]
-    pub outputs: Vec<OutputFile>,
-    #[serde(default)]
-    pub batches: Vec<OutputBatch>,
-}
-
-impl JobOutputResponse {
-    pub fn is_progressive_batches(&self) -> bool {
-        self.delivery_mode == "progressive_batches"
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct OutputFile {
-    pub filename: String,
-    pub download_url: String,
-    pub size_bytes: u64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct OutputBatch {
-    pub index: u32,
-    pub filename: String,
-    pub download_url: String,
-    pub size_bytes: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UsageResponse {
-    pub period_start: String,
-    pub period_end: String,
-    pub cpu_minutes: f64,
-    #[allow(dead_code)]
-    pub gpu_minutes: f64,
-    #[allow(dead_code)]
-    pub total_cost_cents: u64,
-    #[serde(default)]
-    pub total_cost_millicents: i64,
-    pub jobs_count: u64,
-    #[serde(default)]
-    pub balance_millicents: i64,
-    #[serde(default = "default_currency")]
-    pub currency: String,
-}
-
-impl UsageResponse {
-    pub fn total_cost_millicents(&self) -> i64 {
-        if self.total_cost_millicents != 0 {
-            self.total_cost_millicents
-        } else {
-            (self.total_cost_cents as i64) * 1_000
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ApiErrorResponse {
-    pub error: String,
-    #[serde(default)]
-    pub code: Option<String>,
-}
-
-pub(crate) fn parse_error_response(
-    status_code: u16,
-    content_type: Option<&str>,
-    body: &str,
-) -> (String, Option<String>) {
-    if let Ok(parsed) = serde_json::from_str::<ApiErrorResponse>(body) {
-        return (parsed.error, parsed.code);
-    }
-
-    let trimmed = body.trim();
-    let is_html = content_type.is_some_and(|value| {
-        value.contains("text/html") || value.contains("application/xhtml+xml")
-    }) || trimmed.starts_with("<!DOCTYPE html")
-        || trimmed.starts_with("<html");
-
-    if is_html {
-        let message = if status_code >= 500 {
-            "server returned an HTML error page instead of JSON".to_string()
-        } else {
-            "api returned an unexpected HTML response".to_string()
-        };
-
-        return (message, Some("unexpected_html_response".to_string()));
-    }
-
-    let single_line = trimmed
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("request failed");
-
-    (truncate_error_message(single_line, 240), None)
-}
-
-pub(crate) fn truncate_error_message(message: &str, max_len: usize) -> String {
-    if message.chars().count() <= max_len {
-        return message.to_string();
-    }
-
-    message.chars().take(max_len).collect::<String>() + "..."
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ProgressEvent {
-    #[serde(flatten)]
-    pub progress: JobProgress,
-    pub status: JobState,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-impl ApiClient {
-    pub fn from_config(config: &Config) -> Result<Self> {
-        let api_key = config.require_api_key()?;
-        let base_url = config.api_base();
-        let client = Client::builder()
-            .user_agent(format!("cfmpeg/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(30))
-            .build()?;
-
-        Ok(Self {
-            client,
-            base_url,
-            api_key,
-        })
-    }
-
-    pub async fn create_job(&self, request: &CreateJobRequest) -> Result<CreateJobResponse> {
-        let response = self
-            .client
-            .post(format!("{}/jobs", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(request)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_connect() || error.is_timeout() {
-                    CfmpegError::ApiUnreachable(format!(
-                        "{} ({})",
-                        self.base_url,
-                        describe_http_error(&error)
-                    ))
-                } else {
-                    CfmpegError::from(error)
-                }
-            })?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn start_job(&self, job_id: &str, request: &StartJobRequest) -> Result<JobStatus> {
-        let response = self
-            .client
-            .post(format!("{}/jobs/{job_id}/start", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(request)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn prepare_job(&self, job_id: &str) -> Result<JobStatus> {
-        let response = self
-            .client
-            .post(format!("{}/jobs/{job_id}/prepare", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn cancel_job(&self, job_id: &str) -> Result<JobStatus> {
-        let response = self
-            .client
-            .post(format!("{}/jobs/{job_id}/cancel", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn request_segment_upload_targets(
-        &self,
-        job_id: &str,
-        request: &SegmentUploadTargetsRequest,
-    ) -> Result<Vec<SegmentUploadTarget>> {
-        let response = self
-            .client
-            .post(format!(
-                "{}/jobs/{job_id}/ingest/segments/upload-targets",
-                self.base_url
-            ))
-            .bearer_auth(&self.api_key)
-            .json(request)
-            .send()
-            .await?;
-
-        let payload: SegmentUploadTargetsResponse = self.handle_response(response).await?;
-
-        Ok(payload.targets)
-    }
-
-    pub async fn complete_segmented_ingest(
-        &self,
-        job_id: &str,
-        request: &CompleteIngestRequest,
-    ) -> Result<JobStatus> {
-        let response = self
-            .client
-            .post(format!("{}/jobs/{job_id}/ingest/complete", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(request)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn report_segmented_ingest_progress(
-        &self,
-        job_id: &str,
-        request: &IngestProgressRequest,
-    ) -> Result<JobStatus> {
-        let response = self
-            .client
-            .post(format!("{}/jobs/{job_id}/ingest/progress", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(request)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn get_job_status(&self, job_id: &str) -> Result<JobStatus> {
-        let response = self
-            .client
-            .get(format!("{}/jobs/{job_id}", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub fn stream_url(&self, job_id: &str) -> String {
-        format!("{}/jobs/{job_id}/stream", self.base_url)
-    }
-
-    pub fn should_stream_progress(&self) -> bool {
-        let Ok(url) = Url::parse(&self.base_url) else {
-            return true;
-        };
-
-        let Some(host) = url.host_str() else {
-            return true;
-        };
-
-        !matches!(host, "127.0.0.1" | "localhost" | "::1")
-    }
-
-    pub fn api_key(&self) -> &str {
-        &self.api_key
-    }
-
-    pub async fn get_outputs(&self, job_id: &str) -> Result<JobOutputResponse> {
-        let response = self
-            .client
-            .get(format!("{}/jobs/{job_id}/output", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn get_output_batches(&self, job_id: &str) -> Result<JobOutputResponse> {
-        let response = self
-            .client
-            .get(format!("{}/jobs/{job_id}/output-batches", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn get_usage(&self) -> Result<UsageResponse> {
-        let response = self
-            .client
-            .get(format!("{}/usage", self.base_url))
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
-    }
-
-    pub async fn health_check(&self) -> Result<()> {
-        let response = self
-            .client
-            .get(format!("{}/health", self.base_url))
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .map_err(|error| {
-                CfmpegError::ApiUnreachable(format!(
-                    "{} ({})",
-                    self.base_url,
-                    describe_http_error(&error)
-                ))
-            })?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(CfmpegError::ApiUnreachable(format!(
-                "{} (health returned {})",
-                self.base_url,
-                response.status()
-            )))
-        }
-    }
-
-    async fn handle_response<T: serde::de::DeserializeOwned>(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<T> {
-        let status = response.status();
-
-        if status.is_success() {
-            return response.json::<T>().await.map_err(CfmpegError::from);
-        }
-
-        let status_code = status.as_u16();
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response.text().await.unwrap_or_default();
-        let (message, code) = parse_error_response(status_code, content_type.as_deref(), &body);
-
-        Err(CfmpegError::Api {
-            status: status_code,
-            code,
-            message,
-        })
-    }
-}
-
-fn default_currency() -> String {
-    "usd".to_string()
 }

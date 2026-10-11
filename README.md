@@ -25,7 +25,7 @@ brew install cfmpeg/cfmpeg-homebrew-tap/cfmpeg
 cargo install cfmpeg
 ```
 
-Prebuilt releases bundle helper `ffmpeg` and `ffprobe` binaries for cfmpeg's internal remuxing and segmented local-file ingest paths.
+Prebuilt releases bundle a helper `ffmpeg` binary, used for local fallback, direct-stream remuxing, segmented uploads, and joining progressive output batches.
 If you install from source instead, keep `ffmpeg` available on `PATH` or point cfmpeg at an explicit helper with `CFMPEG_FFMPEG_BINARY`.
 
 ## Quick Start
@@ -48,6 +48,7 @@ cfmpeg --remote -i input.mov -c:v libx264 output.mp4
 ```
 
 `cfmpeg auth login` opens the API key page and then prompts you to paste the key back into the CLI for local storage.
+
 ## How It Works
 
 1. You run `cfmpeg` with standard ffmpeg arguments
@@ -78,17 +79,17 @@ cfmpeg --remote -i https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_
 
 ## Features
 
-- **Full ffmpeg compatibility** — any valid ffmpeg command works
+- **ffmpeg-compatible arguments** — ffmpeg arguments pass through unchanged; remote runs reject concat file lists (`-f concat`), `-filter_script`/`-filter_complex_script`, and stdin, `pipe:`, or `/dev/` inputs with an error suggesting `--local`
 - **Parallel multipart uploads** — large files upload fast with chunked parallel transfers
 - **Real-time progress** — streaming progress display, just like local ffmpeg
-- **Automatic local fallback** — if the API is unreachable, cfmpeg falls back to local ffmpeg
+- **Automatic local fallback** — if remote execution is unavailable, cfmpeg falls back to local ffmpeg (see [Local Fallback](#local-fallback))
 - **Automatic output delivery** — completed outputs are downloaded back to your local filesystem
 - **URL passthrough** — remote URLs are fetched directly by the container, no upload needed
 
 ## Authentication
 
 ```bash
-cfmpeg auth login     # Log in via browser
+cfmpeg auth login     # Open the API key page and paste a key
 cfmpeg auth status    # Check auth status
 cfmpeg auth logout    # Remove saved credentials
 ```
@@ -121,13 +122,42 @@ cfmpeg config show    # Print current config with the API key masked
 cfmpeg config edit    # Open in $EDITOR
 ```
 
+Environment variables override the config file:
+
+| Variable | Overrides |
+| --- | --- |
+| `CFMPEG_API_KEY` | `api_key` |
+| `CFMPEG_API_BASE` | `api_base` |
+| `CFMPEG_WEB_BASE` | Dashboard URL (derived from `api_base` by default) |
+| `CFMPEG_CONFIG_DIR` | Directory holding `config.toml` |
+| `CFMPEG_FFMPEG_BINARY` | Path to the local `ffmpeg` |
+| `CFMPEG_REMOTE_PROFILE` | `remote_profile` |
+| `CFMPEG_REMOTE_CPU` | `remote_cpu` |
+| `CFMPEG_REMOTE_MEMORY` | `remote_memory_mb` (accepts `4096`, `512m`, `4g`) |
+| `CFMPEG_REMOTE_TIMEOUT` | `remote_timeout_seconds` (accepts `3600`, `90s`, `15m`, `2h`) |
+
+## Flags and Commands
+
+| Flag / command | Effect |
+| --- | --- |
+| `--local` | Run local ffmpeg; skip the API |
+| `--remote` | Require cloud execution; never fall back |
+| `--no-download` | Leave outputs in cloud storage and print signed URLs |
+| `--cf-profile <balanced\|highcpu>` | Remote execution profile |
+| `--cf-cpu <cores>` | Remote CPU cores |
+| `--cf-memory <size>` | Remote memory, e.g. `4096`, `512m`, `16g` |
+| `--cf-timeout <duration>` | Remote job timeout, e.g. `3600`, `90s`, `15m`, `2h` |
+| `cfmpeg cancel <job_id>` | Cancel a remote job |
+
+Any `--cf-*` flag also implies `--remote`.
+
 ## Usage & Billing
 
 ```bash
 cfmpeg usage          # Current billing period summary
 ```
 
-Billed per second of container wall-clock time:
+Billed per second of container wall-clock time.
 
 Remote jobs are priced from the resources reserved for the resolved execution
 profile, not from a flat CPU tier. The server combines the current CPU core-minute
@@ -145,7 +175,12 @@ Force local execution:
 cfmpeg --local -i input.mov output.mp4
 ```
 
-If the API is unreachable and `local_fallback = true` (default), cfmpeg automatically falls back to local ffmpeg with a warning.
+With `local_fallback = true` (default), cfmpeg falls back to local ffmpeg with a warning when:
+
+- no API key is configured
+- the API health check fails (unreachable or non-2xx)
+- creating or starting the job returns HTTP 402, 404, 405, 501, or 503 (including insufficient balance)
+
 Use `--remote` or any `--cf-*` resource flag to require cloud execution and fail instead of falling back locally.
 
 ## Development

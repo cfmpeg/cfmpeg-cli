@@ -3,21 +3,16 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const FFMPEG_BINARY_ENV: &str = "CFMPEG_FFMPEG_BINARY";
 pub fn ffmpeg_binary() -> Result<PathBuf> {
-    resolve_binary("ffmpeg", FFMPEG_BINARY_ENV)
-}
-
-fn resolve_binary(binary_name: &str, env_var: &str) -> Result<PathBuf> {
     let current_exe = env::current_exe().ok();
-    let env_override = env::var_os(env_var).map(PathBuf::from);
+    let env_override = env::var_os("CFMPEG_FFMPEG_BINARY").map(PathBuf::from);
     let path_env = env::var_os("PATH");
 
-    resolve_binary_path(binary_name, env_override.as_deref(), current_exe.as_deref(), path_env)
+    resolve_binary_path("ffmpeg", env_override.as_deref(), current_exe.as_deref(), path_env)
         .ok_or_else(|| {
-            CfmpegError::Config(format!(
-                "{binary_name} was not found. Install ffmpeg on PATH, set {env_var}, or use a cfmpeg release that bundles helper binaries."
-            ))
+            CfmpegError::Config(
+                "ffmpeg was not found. Install ffmpeg on PATH, set CFMPEG_FFMPEG_BINARY, or use a cfmpeg release that bundles helper binaries.".to_string(),
+            )
         })
 }
 
@@ -27,13 +22,13 @@ fn resolve_binary_path(
     current_exe: Option<&Path>,
     path_env: Option<OsString>,
 ) -> Option<PathBuf> {
-    if let Some(path) = env_override.filter(|path| is_usable_binary(path)) {
+    if let Some(path) = env_override.filter(|path| path.is_file()) {
         return Some(path.to_path_buf());
     }
 
     if let Some(current_exe) = current_exe {
         for candidate in adjacent_binary_candidates(binary_name, current_exe) {
-            if is_usable_binary(&candidate) {
+            if candidate.is_file() {
                 return Some(candidate);
             }
         }
@@ -61,11 +56,7 @@ fn find_on_path(binary_name: &str, path_env: Option<OsString>) -> Option<PathBuf
 
     env::split_paths(&path_env)
         .map(|directory| directory.join(binary_name))
-        .find(|candidate| is_usable_binary(candidate))
-}
-
-fn is_usable_binary(path: &Path) -> bool {
-    path.is_file()
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]
@@ -118,10 +109,10 @@ mod tests {
         fs::create_dir_all(&libexec_dir).expect("create libexec");
 
         let current_exe = bin_dir.join("cfmpeg");
-        let helper = libexec_dir.join("ffprobe");
+        let helper = libexec_dir.join("ffmpeg");
         fs::write(&helper, b"binary").expect("write helper");
 
-        let resolved = resolve_binary_path("ffprobe", None, Some(&current_exe), None);
+        let resolved = resolve_binary_path("ffmpeg", None, Some(&current_exe), None);
 
         assert_eq!(resolved, Some(helper.clone()));
 

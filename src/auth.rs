@@ -36,7 +36,7 @@ pub async fn login(config: &mut Config) -> Result<()> {
 pub fn status(config: &Config) {
     match config.api_key() {
         Some(api_key) => {
-            let source = if config.api_key_from_env() {
+            let source = if Config::api_key_from_env() {
                 "environment"
             } else {
                 "config"
@@ -59,14 +59,14 @@ pub fn logout(config: &mut Config) -> Result<()> {
         Config::config_path()?.display()
     );
 
-    if config.api_key_from_env() {
+    if Config::api_key_from_env() {
         println!("CFMPEG_API_KEY is still set in the environment.");
     }
 
     Ok(())
 }
 
-fn mask_secret(secret: &str) -> String {
+pub fn mask_secret(secret: &str) -> String {
     if secret.len() <= 8 {
         return "*".repeat(secret.len());
     }

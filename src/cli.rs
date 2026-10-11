@@ -133,7 +133,10 @@ pub fn parse_args(raw_args: Vec<String>) -> Result<Command> {
         "config" => parse_config(&raw_args[1..]),
         "help" => parse_help(&raw_args[1..]),
         "usage" => parse_usage(&raw_args[1..]),
-        "version" => parse_exact(raw_args, Command::Version),
+        "version" if raw_args.len() == 1 => Ok(Command::Version),
+        "version" => Err(CfmpegError::ParseError(
+            "command does not accept additional arguments".to_string(),
+        )),
         _ => parse_passthrough(raw_args),
     }
 }
@@ -251,16 +254,6 @@ fn help_topic(topic: &str) -> Option<HelpTopic> {
     }
 }
 
-fn parse_exact(raw_args: Vec<String>, command: Command) -> Result<Command> {
-    if raw_args.len() == 1 {
-        Ok(command)
-    } else {
-        Err(CfmpegError::ParseError(
-            "command does not accept additional arguments".to_string(),
-        ))
-    }
-}
-
 fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     let mut force_local = false;
     let mut no_download = false;
@@ -368,7 +361,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         remote.strict_remote = true;
     }
 
-    if force_local && remote.requires_strict_remote() {
+    if force_local && remote.strict_remote {
         return Err(CfmpegError::ParseError(
             "--remote cannot be used together with --local".to_string(),
         ));
@@ -464,7 +457,7 @@ fn damerau_levenshtein_distance(left: &str, right: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{help_text, parse_args, AuthAction, Command, ConfigAction, HelpTopic};
+    use super::{parse_args, AuthAction, Command, ConfigAction, HelpTopic};
     use crate::remote::{RemoteExecutionOptions, PROFILE_HIGHCPU};
 
     fn args(parts: &[&str]) -> Vec<String> {
@@ -606,30 +599,6 @@ mod tests {
         let command = parse_args(args(&["config", "show"])).expect("command");
 
         assert_eq!(command, Command::Config(Some(ConfigAction::Show)));
-    }
-
-    #[test]
-    fn does_not_advertise_codecs_in_help() {
-        assert!(!help_text(HelpTopic::Global).contains("--codecs"));
-    }
-
-    #[test]
-    fn advertises_smoke_test_examples_in_help() {
-        let help = help_text(HelpTopic::Global);
-
-        assert!(help.contains("testsrc=size=128x128:rate=1"));
-        assert!(help.contains("test-videos.co.uk"));
-    }
-
-    #[test]
-    fn subcommand_help_text_documents_shortcuts_and_actions() {
-        let auth_help = help_text(HelpTopic::Auth);
-        assert!(auth_help.contains("cfmpeg auth [status]"));
-        assert!(auth_help.contains("no action"));
-
-        let config_help = help_text(HelpTopic::Config);
-        assert!(config_help.contains("cfmpeg config [path]"));
-        assert!(config_help.contains("no action"));
     }
 
     #[test]

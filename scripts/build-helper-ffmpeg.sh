@@ -55,8 +55,7 @@ fi
 
 ./configure "${CONFIGURE_FLAGS[@]}"
 
-make -j"$JOBS" ffmpeg ffprobe
+make -j"$JOBS" ffmpeg
 install -m 755 ffmpeg "$PREFIX/bin/ffmpeg"
-install -m 755 ffprobe "$PREFIX/bin/ffprobe"
 
 popd >/dev/null
