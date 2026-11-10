@@ -163,7 +163,7 @@ jobs:
           COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           HOMEBREW_TAP_OWNER: cfmpeg
-          HOMEBREW_TAP_REPO: cfmpeg-homebrew-tap
+          HOMEBREW_TAP_REPO: homebrew-tap
         run: |
           set -euo pipefail
 
@@ -237,11 +237,13 @@ jobs:
             def install
               bin.install "bin/cfmpeg"
               libexec.install "libexec/ffmpeg"
+              doc.install "licenses"
             end
 
             test do
               assert_match version.to_s, shell_output("#{bin}/cfmpeg --version")
               assert_predicate libexec/"ffmpeg", :exist?
+              assert_predicate doc/"licenses/ffmpeg/COPYING.LGPLv2.1", :exist?
             end
           end
           EOF
@@ -267,15 +269,14 @@ jobs:
     if: github.repository == 'cfmpeg/cfmpeg-cli'
     env:
       VERSION: ${{ needs.release.outputs.version }}
-      HOMEBREW_TAP: cfmpeg/cfmpeg-homebrew-tap
-      HOMEBREW_TAP_URL: https://github.com/cfmpeg/cfmpeg-homebrew-tap.git
+      HOMEBREW_TAP: cfmpeg/tap
 
     steps:
       - name: Smoke test Homebrew install
         run: |
           set -euo pipefail
 
-          brew tap "${HOMEBREW_TAP}" "${HOMEBREW_TAP_URL}"
+          brew tap "${HOMEBREW_TAP}"
 
           for attempt in {1..8}; do
             if brew list --versions cfmpeg >/dev/null 2>&1; then
@@ -299,3 +300,23 @@ jobs:
           done
 
           test "$(cfmpeg --version | awk 'NR==1 { print $2 }')" = "$VERSION"
+
+          # People run cfmpeg through Homebrew's symlink in <prefix>/bin, while
+          # the helper ffmpeg stays in the keg's libexec. With no ffmpeg on
+          # PATH, `--local` can only print the helper's own version banner if
+          # cfmpeg follows that symlink back to its keg.
+          LINKED_CFMPEG="$(brew --prefix)/bin/cfmpeg"
+          BUNDLED_FFMPEG="$(brew --prefix)/opt/cfmpeg/libexec/ffmpeg"
+          test -L "$LINKED_CFMPEG"
+          EXPECTED_BANNER="$("$BUNDLED_FFMPEG" -version)"
+          ACTUAL_BANNER="$(env PATH=/usr/bin:/bin "$LINKED_CFMPEG" --local -version || true)"
+          if [ "$ACTUAL_BANNER" != "$EXPECTED_BANNER" ]; then
+            echo "::error::cfmpeg did not run its bundled helper ffmpeg when started through the Homebrew symlink."
+            exit 1
+          fi
+
+          # The formula installs the archive's licence notices with the keg.
+          LICENSES_DIR="$(brew --prefix)/opt/cfmpeg/share/doc/cfmpeg/licenses"
+          test -s "$LICENSES_DIR/cfmpeg/LICENSE"
+          test -s "$LICENSES_DIR/ffmpeg/COPYING.LGPLv2.1"
+          test -s "$LICENSES_DIR/ffmpeg/NOTICE.txt"

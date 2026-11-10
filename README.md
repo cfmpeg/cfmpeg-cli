@@ -17,15 +17,47 @@ No Docker. No Python. No cloud credentials. Install, authenticate, go.
 ## Install
 
 ```bash
-# macOS and Linux
-brew tap cfmpeg/cfmpeg-homebrew-tap https://github.com/cfmpeg/cfmpeg-homebrew-tap.git
-brew install cfmpeg/cfmpeg-homebrew-tap/cfmpeg
+# macOS and Linux: install script
+curl -fsSL https://cfmpeg.com/install.sh | sh
+
+# macOS and Linux: Homebrew
+brew install cfmpeg/tap/cfmpeg
 
 # From source
 cargo install cfmpeg
 ```
 
-Prebuilt releases bundle a helper `ffmpeg` binary, used for local fallback, direct-stream remuxing, segmented uploads, and joining progressive output batches.
+The install script downloads the release for your platform, verifies its checksum, and installs under `/usr/local`, or `~/.local` when `/usr/local` isn't writable.
+Set `CFMPEG_INSTALL_DIR` to pick another prefix and `CFMPEG_VERSION` to pin a release.
+
+### Prebuilt binaries
+
+Every [release](https://github.com/cfmpeg/cfmpeg-cli/releases/latest) carries one archive per platform, each with a `.sha256` checksum next to it:
+
+| Platform | Archive |
+| --- | --- |
+| macOS, Apple silicon | `cfmpeg-darwin-arm64.tar.gz` |
+| macOS, Intel | `cfmpeg-darwin-x64.tar.gz` |
+| Linux x86_64 (glibc) | `cfmpeg-linux-x64.tar.gz` |
+| Linux arm64 (glibc) | `cfmpeg-linux-arm64.tar.gz` |
+| Linux x86_64 (static, musl) | `cfmpeg-linux-x64-musl.tar.gz` |
+| Linux arm64 (static, musl) | `cfmpeg-linux-arm64-musl.tar.gz` |
+| Windows x86_64 | `cfmpeg-windows-x64.zip` |
+
+Each archive holds `bin/cfmpeg` and `libexec/ffmpeg` (`cfmpeg.exe` and `ffmpeg.exe` on Windows).
+Keep the two directories side by side, because cfmpeg looks for its helper in `libexec` next to its own `bin` directory.
+A `licenses` directory carries the licences of everything in the archive, including the FFmpeg build's source and configure flags.
+
+The musl archives are statically linked. Use them on Alpine and other images without glibc, and on distributions whose glibc is too old for the regular Linux builds:
+
+```bash
+# x86_64; use cfmpeg-linux-arm64-musl.tar.gz on arm64
+wget -qO- https://github.com/cfmpeg/cfmpeg-cli/releases/latest/download/cfmpeg-linux-x64-musl.tar.gz | tar -xz -C /usr/local bin libexec
+```
+
+On Windows, extract `cfmpeg-windows-x64.zip` and add its `bin` folder to your `PATH`.
+
+Prebuilt releases bundle a helper `ffmpeg` binary, used for direct-stream remuxing, segmented uploads, and joining progressive output batches, and for local runs only when no other ffmpeg is installed.
 If you install from source instead, keep `ffmpeg` available on `PATH` or point cfmpeg at an explicit helper with `CFMPEG_FFMPEG_BINARY`.
 
 ## Quick Start
@@ -274,7 +306,7 @@ The header of `scripts/generate-ffmpeg-options.py` describes the details.
 
 ## Releases
 
-Homebrew releases are published from GitHub Actions to `cfmpeg/cfmpeg-homebrew-tap` using the release workflows in `.github/workflows/`.
+Homebrew releases are published from GitHub Actions to `cfmpeg/homebrew-tap` using the release workflows in `.github/workflows/`.
 
 ## License
 

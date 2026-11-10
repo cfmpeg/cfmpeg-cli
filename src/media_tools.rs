@@ -7,8 +7,10 @@ pub fn ffmpeg_binary() -> Result<PathBuf> {
     let current_exe = env::current_exe().ok();
     let env_override = env::var_os("CFMPEG_FFMPEG_BINARY").map(PathBuf::from);
     let path_env = env::var_os("PATH");
+    // `ffmpeg.exe` on Windows; the suffix is empty everywhere else.
+    let binary_name = format!("ffmpeg{}", env::consts::EXE_SUFFIX);
 
-    resolve_binary_path("ffmpeg", env_override.as_deref(), current_exe.as_deref(), path_env)
+    resolve_binary_path(&binary_name, env_override.as_deref(), current_exe.as_deref(), path_env)
         .ok_or_else(|| {
             CfmpegError::Config(
                 "ffmpeg was not found. Install ffmpeg on PATH, set CFMPEG_FFMPEG_BINARY, or use a cfmpeg release that bundles helper binaries.".to_string(),

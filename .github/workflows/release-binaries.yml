@@ -7,12 +7,22 @@ on:
         description: 'Tag to build binaries for (e.g., v1.2.3)'
         required: true
         type: string
+      dry_run:
+        description: 'Build the ref this run was started from and keep the archives as workflow artifacts; upload nothing to the release'
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       tag:
         description: 'Tag to build binaries for (e.g., v1.2.3)'
         required: true
         type: string
+      dry_run:
+        description: 'Build the ref this run was started from and keep the archives as workflow artifacts; upload nothing to the release'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,9 +30,43 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   FFMPEG_HELPER_VERSION: "8.0"
+  MUSL_BUILD_IMAGE: rust:alpine
+  MUSL_SMOKE_IMAGE: alpine:latest
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+      ref: ${{ steps.ref.outputs.value }}
+
+    steps:
+      - name: Normalize and validate tag
+        id: tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          TAG="${TAG#refs/tags/}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid tag format '$TAG'. Expected vX.Y.Z"
+            exit 1
+          fi
+          echo "value=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build ref
+        id: ref
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          TAG: ${{ steps.tag.outputs.value }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: building $GITHUB_SHA; nothing will be uploaded to a release."
+            echo "value=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
   build-binaries:
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,21 +82,10 @@ jobs:
             asset_name: cfmpeg-linux-x64
 
     steps:
-      - name: Normalize and validate tag
-        id: tag
-        run: |
-          TAG="${{ inputs.tag }}"
-          TAG="${TAG#refs/tags/}"
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Invalid tag format '$TAG'. Expected vX.Y.Z"
-            exit 1
-          fi
-          echo "value=$TAG" >> "$GITHUB_OUTPUT"
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ steps.tag.outputs.value }}
+          ref: ${{ needs.prepare.outputs.ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -76,6 +109,14 @@ jobs:
       - name: Build bundled ffmpeg helpers
         run: bash scripts/build-helper-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-helper"
 
+      - name: Collect licence notices
+        run: |
+          python3 scripts/assemble-licenses.py \
+            --bundle release/bundle \
+            --kind dynamic \
+            --rust-target "$(rustc -vV | sed -n 's/^host: //p')" \
+            --ffmpeg-licenses "$RUNNER_TEMP/ffmpeg-helper/licenses/ffmpeg"
+
       - name: Prepare release assets
         run: |
           mkdir -p release/bundle/bin release/bundle/libexec
@@ -85,10 +126,242 @@ jobs:
           tar -czf "release/${{ matrix.asset_name }}.tar.gz" -C release/bundle .
           shasum -a 256 "release/${{ matrix.asset_name }}.tar.gz" > "release/${{ matrix.asset_name }}.tar.gz.sha256"
 
+      - name: Verify release archive
+        run: python3 scripts/verify-release-archive.py "release/${{ matrix.asset_name }}.tar.gz" --kind dynamic
+
       - name: Upload to GitHub Release
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.value }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
           files: |
             release/${{ matrix.asset_name }}.tar.gz
             release/${{ matrix.asset_name }}.tar.gz.sha256
+
+      - name: Keep archive as a workflow artifact
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          if-no-files-found: error
+          path: |
+            release/${{ matrix.asset_name }}.tar.gz
+            release/${{ matrix.asset_name }}.tar.gz.sha256
+
+  # Static Linux builds. The CLI and the helper ffmpeg are compiled inside an
+  # Alpine container on a runner of the matching architecture, so everything
+  # links against musl with Alpine's own toolchain and nothing is cross-compiled.
+  build-musl-binaries:
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            asset_name: cfmpeg-linux-arm64-musl
+            rust_target: aarch64-unknown-linux-musl
+          - os: ubuntu-latest
+            asset_name: cfmpeg-linux-x64-musl
+            rust_target: x86_64-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+
+      - name: Build static binaries in Alpine
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          mkdir -p release
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            --env FFMPEG_HELPER_VERSION \
+            --env HOST_UID="$(id -u)" \
+            --env HOST_GID="$(id -g)" \
+            "$MUSL_BUILD_IMAGE" \
+            sh scripts/build-musl-bundle.sh "$RUST_TARGET" release/bundle
+
+      - name: Verify binaries are static
+        run: |
+          command -v readelf
+          for binary in release/bundle/bin/cfmpeg release/bundle/libexec/ffmpeg; do
+            test -f "$binary"
+            if readelf --program-headers "$binary" | grep -q 'Requesting program interpreter'; then
+              echo "::error::$binary needs a dynamic loader."
+              exit 1
+            fi
+            if readelf --dynamic "$binary" | grep -q '(NEEDED)'; then
+              echo "::error::$binary depends on shared libraries."
+              exit 1
+            fi
+          done
+
+      # A stock Alpine image has no glibc and no ffmpeg, so this only passes
+      # when both binaries are static and cfmpeg finds its bundled helper.
+      - name: Smoke test on Alpine
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/release/bundle:/opt/cfmpeg:ro" \
+            "$MUSL_SMOKE_IMAGE" \
+            sh -euc '
+              /opt/cfmpeg/bin/cfmpeg --version
+              /opt/cfmpeg/libexec/ffmpeg -hide_banner -version
+              /opt/cfmpeg/bin/cfmpeg --local -hide_banner -loglevel error -f lavfi -i testsrc=size=64x64:rate=5 -t 1 -c:v mpeg4 /tmp/cfmpeg-smoke.mp4
+              test -s /tmp/cfmpeg-smoke.mp4
+            '
+
+      # Entries are recorded as root-owned so the archive can be unpacked
+      # straight into a prefix such as /usr/local by root in a container.
+      - name: Prepare release assets
+        run: |
+          tar --owner=0 --group=0 --numeric-owner -czf "release/${{ matrix.asset_name }}.tar.gz" -C release/bundle bin libexec licenses
+          shasum -a 256 "release/${{ matrix.asset_name }}.tar.gz" > "release/${{ matrix.asset_name }}.tar.gz.sha256"
+
+      - name: Verify release archive
+        run: python3 scripts/verify-release-archive.py "release/${{ matrix.asset_name }}.tar.gz" --kind musl
+
+      - name: Upload to GitHub Release
+        if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          files: |
+            release/${{ matrix.asset_name }}.tar.gz
+            release/${{ matrix.asset_name }}.tar.gz.sha256
+
+      - name: Keep archive as a workflow artifact
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          if-no-files-found: error
+          path: |
+            release/${{ matrix.asset_name }}.tar.gz
+            release/${{ matrix.asset_name }}.tar.gz.sha256
+
+  # The Windows helper ffmpeg is cross-compiled from the same ffmpeg.org source
+  # with mingw-w64 on Linux, then bundled and exercised on a Windows runner.
+  build-windows-helper:
+    needs: prepare
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+
+      - name: Install the mingw-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 nasm
+
+      - name: Cross-compile the helper ffmpeg
+        env:
+          FFMPEG_HELPER_TARGET: windows-x64
+        run: |
+          bash scripts/build-helper-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-helper"
+          mkdir -p windows-helper
+          cp "$RUNNER_TEMP/ffmpeg-helper/bin/ffmpeg.exe" windows-helper/ffmpeg.exe
+          cp -R "$RUNNER_TEMP/ffmpeg-helper/licenses" windows-helper/licenses
+
+      - name: Hand the helper to the Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-ffmpeg-helper
+          path: windows-helper/
+          if-no-files-found: error
+          retention-days: 1
+
+  build-windows-binary:
+    needs:
+      - prepare
+      - build-windows-helper
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      ASSET_NAME: cfmpeg-windows-x64
+      RUST_TARGET: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # Link the C runtime statically so cfmpeg.exe runs on machines without
+      # the Visual C++ redistributable.
+      - name: Build release binary
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked --target "$RUST_TARGET"
+
+      - name: Download the helper ffmpeg
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-ffmpeg-helper
+          path: windows-helper
+
+      - name: Assemble bundle
+        run: |
+          mkdir -p release/bundle/bin release/bundle/libexec
+          cp "target/$RUST_TARGET/release/cfmpeg.exe" release/bundle/bin/cfmpeg.exe
+          cp windows-helper/ffmpeg.exe release/bundle/libexec/ffmpeg.exe
+          python scripts/assemble-licenses.py \
+            --bundle release/bundle \
+            --kind windows \
+            --rust-target "$RUST_TARGET" \
+            --ffmpeg-licenses windows-helper/licenses/ffmpeg
+
+      # The runner image ships no ffmpeg of its own, so `--local` only works if
+      # cfmpeg finds the bundled ffmpeg.exe. The version check fails loudly if
+      # some other ffmpeg on PATH ever answers instead.
+      - name: Smoke test on Windows
+        run: |
+          release/bundle/bin/cfmpeg.exe --version
+          release/bundle/libexec/ffmpeg.exe -hide_banner -version
+          release/bundle/bin/cfmpeg.exe --local -version | grep -F "ffmpeg version ${FFMPEG_HELPER_VERSION} "
+          release/bundle/bin/cfmpeg.exe --local -hide_banner -loglevel error -f lavfi -i testsrc=size=64x64:rate=5 -t 1 -c:v mpeg4 release/cfmpeg-smoke.mp4
+          test -s release/cfmpeg-smoke.mp4
+
+      - name: Prepare release assets
+        run: |
+          (cd release/bundle && 7z a -tzip "../${ASSET_NAME}.zip" bin libexec licenses)
+          HASH="$(sha256sum < "release/${ASSET_NAME}.zip" | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" "release/${ASSET_NAME}.zip" > "release/${ASSET_NAME}.zip.sha256"
+
+      - name: Verify release archive
+        run: python scripts/verify-release-archive.py "release/${ASSET_NAME}.zip" --kind windows
+
+      - name: Upload to GitHub Release
+        if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          files: |
+            release/${{ env.ASSET_NAME }}.zip
+            release/${{ env.ASSET_NAME }}.zip.sha256
+
+      - name: Keep archive as a workflow artifact
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          if-no-files-found: error
+          path: |
+            release/${{ env.ASSET_NAME }}.zip
+            release/${{ env.ASSET_NAME }}.zip.sha256

@@ -47,3 +47,21 @@ jobs:
 
       - name: Verify build
         run: cargo build --locked
+
+  # Releases ship a Windows binary, so make sure the crate still compiles and
+  # links there. The test suite itself only runs on Linux.
+  windows-build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Windows build
+        run: cargo build --locked
