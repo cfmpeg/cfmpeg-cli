@@ -1,0 +1,3 @@
+the remote worker's ffmpeg (conda-forge build, ffmpeg 8.1.2, linux x86_64)
+captured and probed 2026-11-10 where that ffmpeg is installed, with generate-ffmpeg-options.py --capture; help-full.txt is cut after the 'AVFilter AVOptions:' heading
+the worker tracks ffmpeg 8.x, so capture this dump again whenever the worker's ffmpeg changes

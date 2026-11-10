@@ -1,7 +1,8 @@
 use crate::api::{ApiClient, OutputBatch, OutputDeliveryMode, OutputFile};
 use crate::error::{CfmpegError, Result};
+use crate::local_output::PartialOutput;
 use crate::media_tools::ffmpeg_binary;
-use crate::parser::Output;
+use crate::parser::{Output, Overwrite};
 use crate::transfer::{file_name_or, retry_with_backoff, transfer_progress_bar};
 use futures::{stream, StreamExt};
 use indicatif::ProgressBar;
@@ -10,10 +11,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -26,6 +24,7 @@ pub async fn download_outputs(
     client: &Client,
     remote_outputs: &[OutputFile],
     requested_outputs: &[Output],
+    overwrite: Overwrite,
 ) -> Result<()> {
     if remote_outputs.is_empty() {
         return Err(CfmpegError::Protocol(
@@ -54,7 +53,7 @@ pub async fn download_outputs(
             })
             .unwrap_or_else(|| default_dir.join(&remote_output.filename));
 
-        download_file(client, remote_output, &target_path).await?;
+        download_file(client, remote_output, &target_path, overwrite).await?;
     }
 
     Ok(())
@@ -71,7 +70,8 @@ pub async fn download_progressive_batches(
     client: &Client,
     job_id: &str,
     target_path: &Path,
-    stop: Arc<AtomicBool>,
+    stop: &AtomicBool,
+    overwrite: Overwrite,
 ) -> Result<()> {
     let temp_dir = tempfile::Builder::new()
         .prefix("cfmpeg-output-batches-")
@@ -118,11 +118,13 @@ pub async fn download_progressive_batches(
     }
 
     concat_progressive_batches(
+        &ffmpeg_binary()?,
         &ordered_batches
             .iter()
             .map(|(_, path)| path.clone())
             .collect::<Vec<_>>(),
         target_path,
+        overwrite,
     )
     .await
 }
@@ -147,6 +149,7 @@ async fn download_missing_batches(
                 size_bytes: batch.size_bytes,
             },
             &batch_path,
+            Overwrite::Allowed,
         )
         .await?;
         downloaded.insert(batch.index, batch_path);
@@ -155,28 +158,29 @@ async fn download_missing_batches(
     Ok(())
 }
 
+/// Downloads into a temporary file next to `target_path` and renames it into
+/// place once every byte has arrived, so the destination is either untouched
+/// or complete.
 async fn download_file(
     client: &Client,
     remote_output: &OutputFile,
     target_path: &Path,
+    overwrite: Overwrite,
 ) -> Result<()> {
-    if let Some(parent) = target_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
     let total_bytes = remote_output.size_bytes;
     let filename = file_name_or(target_path, "output");
+    let partial = PartialOutput::create(target_path)?;
     let progress = transfer_progress_bar("Downloading", total_bytes, filename.clone());
 
     let download_result = if should_parallel_download(total_bytes)
         && supports_parallel_download(client, &remote_output.download_url, total_bytes).await
     {
-        download_file_parallel(client, remote_output, target_path, &progress).await
+        download_file_parallel(client, remote_output, partial.path(), &progress).await
     } else {
-        download_file_sequential(client, remote_output, target_path, &progress).await
+        download_file_sequential(client, remote_output, partial.path(), &progress).await
     };
 
-    match download_result {
+    match download_result.and_then(|()| partial.commit(overwrite)) {
         Ok(()) => {
             progress.finish_with_message(filename);
             Ok(())
@@ -234,8 +238,12 @@ async fn download_file_sequential(
         });
     }
 
-    let mut file = tokio::fs::File::create(target_path).await?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(target_path)
+        .await?;
     let mut stream = response.bytes_stream();
+    let mut received = 0u64;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| CfmpegError::Download {
@@ -244,10 +252,22 @@ async fn download_file_sequential(
         })?;
 
         file.write_all(&chunk).await?;
+        received += chunk.len() as u64;
         progress.inc(chunk.len() as u64);
     }
 
     file.flush().await?;
+
+    // The API reports a size of 0 when it does not know it.
+    if remote_output.size_bytes > 0 && received != remote_output.size_bytes {
+        return Err(CfmpegError::Download {
+            filename: remote_output.filename.clone(),
+            reason: format!(
+                "received {received} bytes, expected {}",
+                remote_output.size_bytes
+            ),
+        });
+    }
 
     Ok(())
 }
@@ -262,7 +282,10 @@ async fn download_file_parallel(
     let concurrency = download_concurrency(total_bytes);
     let ranges = build_download_ranges(total_bytes, PARALLEL_DOWNLOAD_CHUNK_SIZE_BYTES);
 
-    let file = tokio::fs::File::create(target_path).await?;
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(target_path)
+        .await?;
     file.set_len(total_bytes).await?;
     drop(file);
 
@@ -365,11 +388,15 @@ fn format_output_urls(remote_outputs: &[OutputFile]) -> Vec<String> {
         .collect()
 }
 
-async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path) -> Result<()> {
-    if let Some(parent) = target_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
+/// Joins the batches into a temporary file next to `target_path` and renames
+/// it into place when ffmpeg succeeds.
+async fn concat_progressive_batches(
+    ffmpeg: &Path,
+    batch_paths: &[PathBuf],
+    target_path: &Path,
+    overwrite: Overwrite,
+) -> Result<()> {
+    let partial = PartialOutput::create(target_path)?;
     let manifest_file = tempfile::Builder::new()
         .prefix("cfmpeg-output-batches-")
         .suffix(".txt")
@@ -380,12 +407,12 @@ async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path)
         .collect::<String>();
     tokio::fs::write(manifest_file.path(), manifest).await?;
 
-    let ffmpeg = ffmpeg_binary()?;
     let output = Command::new(ffmpeg)
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
         .arg("-nostdin")
+        // `-y` because the temporary file already exists, empty.
         .arg("-y")
         .arg("-f")
         .arg("concat")
@@ -395,9 +422,10 @@ async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path)
         .arg(manifest_file.path())
         .arg("-c")
         .arg("copy")
-        .arg(target_path)
+        .arg(partial.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .output()
         .await?;
 
@@ -413,7 +441,14 @@ async fn concat_progressive_batches(batch_paths: &[PathBuf], target_path: &Path)
         });
     }
 
-    Ok(())
+    if tokio::fs::metadata(partial.path()).await?.len() == 0 {
+        return Err(CfmpegError::Download {
+            filename: target_path.display().to_string(),
+            reason: "ffmpeg concat wrote an empty file".to_string(),
+        });
+    }
+
+    partial.commit(overwrite)
 }
 
 #[cfg(test)]
@@ -422,6 +457,13 @@ mod tests {
         build_download_ranges, download_concurrency, format_output_urls, should_parallel_download,
     };
     use crate::api::OutputFile;
+    #[cfg(unix)]
+    use {
+        super::concat_progressive_batches,
+        crate::parser::Overwrite,
+        std::fs,
+        std::path::{Path, PathBuf},
+    };
 
     #[test]
     fn formats_output_urls_for_no_download_mode() {
@@ -459,5 +501,60 @@ mod tests {
         assert_eq!(download_concurrency(128 * 1024 * 1024), 4);
         assert_eq!(download_concurrency(512 * 1024 * 1024), 6);
         assert_eq!(download_concurrency(2 * 1024 * 1024 * 1024), 8);
+    }
+
+    /// Writes a stand-in ffmpeg that writes `contents` to its last argument
+    /// and exits with `status`.
+    #[cfg(unix)]
+    fn fake_ffmpeg(directory: &Path, contents: &str, status: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = directory.join(format!("fake-ffmpeg-{status}-{}", contents.len()));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor last; do :; done\nprintf '%s' '{contents}' > \"$last\"\nexit {status}\n"
+            ),
+        )
+        .expect("write fake ffmpeg");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn joined_batches_replace_the_output_only_when_ffmpeg_succeeds() {
+        let tools = tempfile::tempdir().expect("tools dir");
+        let outputs = tempfile::tempdir().expect("output dir");
+        let target = outputs.path().join("out.mp4");
+        let batches = [tools.path().join("batch_00000.mp4")];
+        let entries = || -> Vec<_> {
+            fs::read_dir(outputs.path())
+                .expect("read dir")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect()
+        };
+        fs::write(&target, b"previous").expect("existing output");
+
+        for (contents, status) in [("half", 1), ("", 0)] {
+            let ffmpeg = fake_ffmpeg(tools.path(), contents, status);
+
+            let error = concat_progressive_batches(&ffmpeg, &batches, &target, Overwrite::Allowed)
+                .await
+                .expect_err("concat should fail");
+
+            assert!(error.to_string().contains("download failed"), "{error}");
+            assert_eq!(fs::read(&target).expect("read output"), b"previous");
+            assert_eq!(entries(), ["out.mp4"]);
+        }
+
+        let ffmpeg = fake_ffmpeg(tools.path(), "joined", 0);
+        concat_progressive_batches(&ffmpeg, &batches, &target, Overwrite::Allowed)
+            .await
+            .expect("concat");
+
+        assert_eq!(fs::read(&target).expect("read output"), b"joined");
+        assert_eq!(entries(), ["out.mp4"]);
     }
 }

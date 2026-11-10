@@ -1,7 +1,9 @@
 use crate::error::{CfmpegError, Result};
+use crate::parser::Overwrite;
 use crate::remote::{
     parse_cpu_cores, parse_memory_mb, parse_profile, parse_timeout_seconds, RemoteExecutionOptions,
 };
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -10,10 +12,17 @@ pub enum Command {
         job_id: String,
     },
     Config(Option<ConfigAction>),
+    Download {
+        job_id: String,
+        /// Where to write the outputs; empty for the job's own file names.
+        paths: Vec<PathBuf>,
+        overwrite: Overwrite,
+    },
     Encode {
         ffmpeg_args: Vec<String>,
         force_local: bool,
         no_download: bool,
+        allow_fallback: bool,
         remote: RemoteExecutionOptions,
     },
     Help {
@@ -44,6 +53,7 @@ pub enum HelpTopic {
     Auth,
     Cancel,
     Config,
+    Download,
     Usage,
 }
 
@@ -53,18 +63,23 @@ fn help_text(topic: HelpTopic) -> &'static str {
             "cfmpeg\n",
             "\n",
             "Usage:\n",
-            "  cfmpeg [--local|--remote] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-timeout <duration>] <ffmpeg args...>\n",
+            "  cfmpeg [--local|--remote|--allow-fallback] [--no-download] [--cf-profile <value>] [--cf-cpu <cores>] [--cf-memory <size>] [--cf-timeout <duration>] <ffmpeg args...>\n",
             "  cfmpeg auth <login|status|logout>\n",
             "  cfmpeg cancel <job_id>\n",
+            "  cfmpeg download [-y|-n] <job_id> [output paths...]\n",
             "  cfmpeg config [path|show|edit]\n",
             "  cfmpeg usage\n",
             "  cfmpeg --version\n",
-            "  cfmpeg help [auth|cancel|config|usage]\n",
+            "  cfmpeg help [auth|cancel|config|download|usage]\n",
             "\n",
             "Notes:\n",
             "  - Arguments that look like ffmpeg flags are passed through directly.\n",
-            "  - Use `--local` to force local ffmpeg execution.\n",
-            "  - Use `--remote` to require cloud execution and disable local fallback for that run.\n",
+            "  - Options that the workers' ffmpeg 8 does not know are rejected before anything is uploaded.\n",
+            "  - Use `--local` to run the command with local ffmpeg instead.\n",
+            "  - Remote failures are errors by default. Use `--allow-fallback` to run local ffmpeg when\n",
+            "    cloud execution is unavailable (no API key, API unreachable, insufficient balance).\n",
+            "  - Use `--remote` to require cloud execution even when fallback is enabled in the config.\n",
+            "  - Ctrl-C cancels the remote job. Outputs are written atomically; `-n` never overwrites.\n",
             "  - Use `--no-download` to leave completed outputs in cloud storage and print signed URLs instead.\n",
             "  - Use `--cf-*` flags to request remote execution resources without changing ffmpeg arguments.\n",
             "  - Use `cfmpeg --help` or `cfmpeg help` for CLI help.\n",
@@ -93,6 +108,20 @@ fn help_text(topic: HelpTopic) -> &'static str {
             "  cfmpeg cancel <job_id>\n",
             "\n",
             "Cancel a remote job by id.\n",
+        ),
+        HelpTopic::Download => concat!(
+            "cfmpeg download\n",
+            "\n",
+            "Usage:\n",
+            "  cfmpeg download [-y|-n] <job_id> [output paths...]\n",
+            "\n",
+            "Download the outputs of a finished job again, while cloud storage still has them.\n",
+            "\n",
+            "Notes:\n",
+            "  - Without paths, each output is written to the current directory under the name the job\n",
+            "    stored it with (output_0.mp4, output_1.mp4, ...).\n",
+            "  - With paths, give one per output of the job, in the order of the original command.\n",
+            "  - Existing files are overwritten unless `-n` is given. `-y` is accepted for symmetry.\n",
         ),
         HelpTopic::Config => concat!(
             "cfmpeg config\n",
@@ -130,6 +159,7 @@ pub fn parse_args(raw_args: Vec<String>) -> Result<Command> {
     match raw_args[0].as_str() {
         "auth" => parse_auth(&raw_args[1..]),
         "cancel" => parse_cancel(&raw_args[1..]),
+        "download" => parse_download(&raw_args[1..]),
         "config" => parse_config(&raw_args[1..]),
         "help" => parse_help(&raw_args[1..]),
         "usage" => parse_usage(&raw_args[1..]),
@@ -181,6 +211,50 @@ fn parse_cancel(args: &[String]) -> Result<Command> {
     }
 }
 
+fn parse_download(args: &[String]) -> Result<Command> {
+    if is_help_request(args) {
+        return Ok(help_command(HelpTopic::Download, true));
+    }
+
+    let mut force_overwrite = false;
+    let mut never_overwrite = false;
+    let mut positional = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "-y" => force_overwrite = true,
+            "-n" => never_overwrite = true,
+            _ if arg.starts_with('-') && arg.len() > 1 => {
+                return Err(CfmpegError::ParseError(format!(
+                    "unknown download option: {arg}; expected -y, -n, or --help"
+                )));
+            }
+            _ => positional.push(arg),
+        }
+    }
+
+    let Some((job_id, paths)) = positional.split_first() else {
+        return Err(CfmpegError::ParseError(
+            "download requires a job id".to_string(),
+        ));
+    };
+    let overwrite = match (force_overwrite, never_overwrite) {
+        (true, true) => {
+            return Err(CfmpegError::ParseError(
+                "both -y and -n supplied".to_string(),
+            ));
+        }
+        (_, true) => Overwrite::Never,
+        (_, false) => Overwrite::Allowed,
+    };
+
+    Ok(Command::Download {
+        job_id: (*job_id).clone(),
+        paths: paths.iter().map(PathBuf::from).collect(),
+        overwrite,
+    })
+}
+
 fn parse_config(args: &[String]) -> Result<Command> {
     if is_help_request(args) {
         return Ok(help_command(HelpTopic::Config, true));
@@ -209,7 +283,7 @@ fn parse_help(args: &[String]) -> Result<Command> {
             .map(|topic| help_command(topic, true))
             .ok_or_else(|| {
                 CfmpegError::ParseError(format!(
-                    "unknown help topic: {topic}; expected auth, cancel, config, or usage"
+                    "unknown help topic: {topic}; expected auth, cancel, config, download, or usage"
                 ))
             }),
         _ => Err(CfmpegError::ParseError(
@@ -249,6 +323,7 @@ fn help_topic(topic: &str) -> Option<HelpTopic> {
         "auth" => Some(HelpTopic::Auth),
         "cancel" => Some(HelpTopic::Cancel),
         "config" => Some(HelpTopic::Config),
+        "download" => Some(HelpTopic::Download),
         "usage" => Some(HelpTopic::Usage),
         _ => None,
     }
@@ -258,6 +333,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     let mut force_local = false;
     let mut no_download = false;
     let mut force_remote = false;
+    let mut allow_fallback = false;
     let mut show_version = false;
     let mut ffmpeg_args = Vec::new();
     let mut remote = RemoteExecutionOptions::default();
@@ -268,6 +344,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         match arg.as_str() {
             "--local" => force_local = true,
             "--remote" => force_remote = true,
+            "--allow-fallback" => allow_fallback = true,
             "--no-download" => no_download = true,
             "--version" => show_version = true,
             _ if arg.starts_with("--cf-profile=") => {
@@ -344,7 +421,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
     }
 
     if show_version {
-        if force_local || force_remote || no_download || !ffmpeg_args.is_empty() {
+        if force_local || force_remote || allow_fallback || no_download || !ffmpeg_args.is_empty() {
             return Err(CfmpegError::ParseError(
                 "--version must be used on its own".to_string(),
             ));
@@ -373,7 +450,15 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         ));
     }
 
-    if !remote.is_empty() {
+    if allow_fallback && force_remote {
+        return Err(CfmpegError::ParseError(
+            "--allow-fallback cannot be used together with --remote".to_string(),
+        ));
+    }
+
+    // Asking for remote resources means asking for a remote run, unless the
+    // same command line explicitly allows the fallback.
+    if !remote.is_empty() && !allow_fallback {
         remote.strict_remote = true;
     }
 
@@ -381,6 +466,7 @@ fn parse_passthrough(raw_args: Vec<String>) -> Result<Command> {
         ffmpeg_args,
         force_local,
         no_download,
+        allow_fallback,
         remote,
     })
 }
@@ -401,6 +487,7 @@ fn suggested_cfmpeg_flag(arg: &str) -> Option<&'static str> {
     const OWNED_FLAGS: &[&str] = &[
         "--local",
         "--remote",
+        "--allow-fallback",
         "--no-download",
         "--cf-profile",
         "--cf-cpu",
@@ -458,7 +545,9 @@ fn damerau_levenshtein_distance(left: &str, right: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{parse_args, AuthAction, Command, ConfigAction, HelpTopic};
+    use crate::parser::Overwrite;
     use crate::remote::{RemoteExecutionOptions, PROFILE_HIGHCPU};
+    use std::path::PathBuf;
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
@@ -475,6 +564,7 @@ mod tests {
                 ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
                 force_local: true,
                 no_download: false,
+                allow_fallback: false,
                 remote: RemoteExecutionOptions::default(),
             }
         );
@@ -501,6 +591,7 @@ mod tests {
                 ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
                 force_local: false,
                 no_download: false,
+                allow_fallback: false,
                 remote: RemoteExecutionOptions {
                     profile: Some(PROFILE_HIGHCPU.to_string()),
                     cpu: Some(8),
@@ -595,6 +686,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_download_subcommand() {
+        assert_eq!(
+            parse_args(args(&["download", "job_123"])).expect("command"),
+            Command::Download {
+                job_id: "job_123".to_string(),
+                paths: Vec::new(),
+                overwrite: Overwrite::Allowed,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["download", "-n", "job_123", "a.mp4", "out/b.webm"]))
+                .expect("command"),
+            Command::Download {
+                job_id: "job_123".to_string(),
+                paths: vec![PathBuf::from("a.mp4"), PathBuf::from("out/b.webm")],
+                overwrite: Overwrite::Never,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["download", "--help"])).expect("command"),
+            Command::Help {
+                topic: HelpTopic::Download,
+                exit_success: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_contradictory_download_commands() {
+        for (arguments, expected) in [
+            (&["download"][..], "requires a job id"),
+            (&["download", "-y"][..], "requires a job id"),
+            (&["download", "-y", "-n", "job_123"][..], "both -y and -n"),
+            (
+                &["download", "--force", "job_123"][..],
+                "unknown download option",
+            ),
+        ] {
+            let error = parse_args(args(arguments)).expect_err("error");
+
+            assert!(
+                error.to_string().contains(expected),
+                "{arguments:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_config_subcommand() {
         let command = parse_args(args(&["config", "show"])).expect("command");
 
@@ -611,6 +750,7 @@ mod tests {
                 ffmpeg_args: args(&["--codecs", "output.txt"]),
                 force_local: false,
                 no_download: false,
+                allow_fallback: false,
                 remote: RemoteExecutionOptions::default(),
             }
         );
@@ -656,12 +796,71 @@ mod tests {
                 ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
                 force_local: false,
                 no_download: false,
+                allow_fallback: false,
                 remote: RemoteExecutionOptions {
                     strict_remote: true,
                     ..RemoteExecutionOptions::default()
                 },
             }
         );
+    }
+
+    #[test]
+    fn parses_allow_fallback_flag_separately_from_ffmpeg_args() {
+        let command = parse_args(args(&["--allow-fallback", "-i", "input.mov", "output.mp4"]))
+            .expect("command");
+
+        assert_eq!(
+            command,
+            Command::Encode {
+                ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
+                force_local: false,
+                no_download: false,
+                allow_fallback: true,
+                remote: RemoteExecutionOptions::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_allow_fallback_keeps_resource_flags_from_requiring_remote() {
+        let command = parse_args(args(&[
+            "--allow-fallback",
+            "--cf-cpu",
+            "8",
+            "-i",
+            "input.mov",
+            "output.mp4",
+        ]))
+        .expect("command");
+
+        assert_eq!(
+            command,
+            Command::Encode {
+                ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
+                force_local: false,
+                no_download: false,
+                allow_fallback: true,
+                remote: RemoteExecutionOptions {
+                    cpu: Some(8),
+                    ..RemoteExecutionOptions::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_allow_fallback_with_remote_flag() {
+        let error = parse_args(args(&[
+            "--allow-fallback",
+            "--remote",
+            "-i",
+            "input.mov",
+            "output.mp4",
+        ]))
+        .expect_err("error");
+
+        assert!(error.to_string().contains("--allow-fallback"));
     }
 
     #[test]
@@ -689,6 +888,7 @@ mod tests {
                 ffmpeg_args: args(&["-i", "input.mov", "output.mp4"]),
                 force_local: false,
                 no_download: true,
+                allow_fallback: false,
                 remote: RemoteExecutionOptions::default(),
             }
         );

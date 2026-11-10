@@ -48,6 +48,8 @@ pub async fn stream_input(client: &Client, ingest: &JobIngest, input_path: &Path
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                // An interrupted upload must not leave the remux running.
+                .kill_on_drop(true)
                 .spawn()?;
 
             let stdout = child.stdout.take().expect("remux stdout is piped");
@@ -66,8 +68,9 @@ pub async fn stream_input(client: &Client, ingest: &JobIngest, input_path: &Path
                 handle_stream_response(client, stream_url, claim_url, content_type, body).await;
 
             let status = child.wait().await?;
-            let stderr_output = stderr_task.await.map_err(|error| {
-                CfmpegError::JobFailed(format!("local remux stderr task failed: {error}"))
+            let stderr_output = stderr_task.await.map_err(|error| CfmpegError::Upload {
+                filename: input_path.display().to_string(),
+                reason: format!("local remux stderr task failed: {error}"),
             })??;
 
             if !status.success() && response.is_ok() {
@@ -78,9 +81,10 @@ pub async fn stream_input(client: &Client, ingest: &JobIngest, input_path: &Path
                     .map(str::trim)
                     .unwrap_or("ffmpeg remux failed");
 
-                return Err(CfmpegError::JobFailed(format!(
-                    "local remux failed before upload completed: {detail}"
-                )));
+                return Err(CfmpegError::Upload {
+                    filename: input_path.display().to_string(),
+                    reason: format!("local remux failed before upload completed: {detail}"),
+                });
             }
 
             response

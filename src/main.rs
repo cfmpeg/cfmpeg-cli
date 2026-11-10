@@ -5,8 +5,14 @@ mod config;
 mod download;
 mod error;
 mod fallback;
+mod ffmpeg_options;
+mod interrupt;
 mod job;
+mod job_download;
+mod local_output;
+mod local_references;
 mod media_tools;
+mod output_support;
 mod parser;
 mod remote;
 mod stream;
@@ -14,32 +20,42 @@ mod transfer;
 mod upload;
 
 use crate::api::{
-    ApiClient, CompleteIngestRequest, CompletedMultipartUpload, CreateJobRequest, IngestMode,
-    InputSource, JobInput, OutputDeliveryMode, OutputDeliveryRequest, StartJobRequest,
-    UsageResponse,
+    ApiClient, CompleteIngestRequest, CompletedMultipartUpload, CreateJobRequest,
+    CreateJobResponse, IngestMode, InputSource, JobInput, JobOutputResponse, OutputDeliveryMode,
+    OutputDeliveryRequest, StartJobRequest, UsageResponse,
 };
 use crate::cli::{AuthAction, Command, ConfigAction};
 use crate::config::Config;
 use crate::error::{CfmpegError, Result};
-use crate::parser::Input;
+use crate::interrupt::Interrupts;
+use crate::parser::{Input, ParsedCommand};
+use crate::remote::RemoteExecutionOptions;
 use console::style;
 use reqwest::Client;
 use serde::Serialize;
+use std::cell::Cell;
 use std::process;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("  {} {}", style("error:").red().bold(), error);
-        process::exit(1);
-    }
+    let exit_code = match run().await {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            // An interrupt has been reported already, when the remote job was
+            // cancelled.
+            if !matches!(error, CfmpegError::Interrupted(_)) {
+                eprintln!("  {} {}", style("error:").red().bold(), error);
+            }
+            error.exit_code()
+        }
+    };
+
+    process::exit(exit_code);
 }
 
-async fn run() -> Result<()> {
+/// Runs the command line and returns the process exit code.
+async fn run() -> Result<i32> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     match cli::parse_args(raw_args)? {
@@ -47,38 +63,56 @@ async fn run() -> Result<()> {
             let mut config = Config::load()?;
 
             match action {
-                AuthAction::Login => auth::login(&mut config).await,
-                AuthAction::Logout => auth::logout(&mut config),
-                AuthAction::Status => {
-                    auth::status(&config);
-                    Ok(())
-                }
+                AuthAction::Login => auth::login(&mut config).await?,
+                AuthAction::Logout => auth::logout(&mut config)?,
+                AuthAction::Status => auth::status(&config),
             }
         }
-        Command::Cancel { job_id } => cancel_job(&job_id).await,
-        Command::Config(action) => handle_config_command(action),
+        Command::Cancel { job_id } => cancel_job(&job_id).await?,
+        Command::Config(action) => handle_config_command(action)?,
+        Command::Download {
+            job_id,
+            paths,
+            overwrite,
+        } => {
+            let outputs = job_download::run(&job_id, &paths, overwrite).await?;
+            eprintln!();
+            print_local_completion(&outputs);
+        }
         Command::Encode {
             ffmpeg_args,
             force_local,
             no_download,
+            allow_fallback,
             remote,
-        } => run_encode(&ffmpeg_args, force_local, no_download, remote).await,
+        } => {
+            return run_encode(
+                &ffmpeg_args,
+                EncodeOptions {
+                    force_local,
+                    no_download,
+                    allow_fallback,
+                    remote,
+                },
+            )
+            .await;
+        }
         Command::Help {
             topic,
             exit_success,
         } => {
             cli::print_help(topic);
-            if exit_success {
-                Ok(())
-            } else {
-                Err(CfmpegError::ParseError(
+            if !exit_success {
+                return Err(CfmpegError::ParseError(
                     "no command or ffmpeg arguments provided".to_string(),
-                ))
+                ));
             }
         }
-        Command::Usage => show_usage().await,
-        Command::Version => show_version().await,
+        Command::Usage => show_usage().await?,
+        Command::Version => show_version().await?,
     }
+
+    Ok(0)
 }
 
 async fn cancel_job(job_id: &str) -> Result<()> {
@@ -122,7 +156,7 @@ fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
             let display_config = DisplayConfig {
                 api_key: config.api_key().map(|value| auth::mask_secret(&value)),
                 api_base: config.api_base(),
-                local_fallback: config.local_fallback,
+                allow_fallback: config.allow_fallback()?,
                 remote_profile: config.remote_profile.clone(),
                 remote_cpu: config.remote_cpu,
                 remote_memory_mb: config.remote_memory_mb,
@@ -138,46 +172,74 @@ fn handle_config_command(action: Option<ConfigAction>) -> Result<()> {
     }
 }
 
-async fn run_encode(
-    ffmpeg_args: &[String],
+/// cfmpeg's own flags for an encode run.
+struct EncodeOptions {
     force_local: bool,
     no_download: bool,
-    remote: remote::RemoteExecutionOptions,
-) -> Result<()> {
+    allow_fallback: bool,
+    remote: RemoteExecutionOptions,
+}
+
+/// What to do when remote execution is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fallback {
+    /// Run the command with local ffmpeg.
+    Local,
+    /// Fail and explain how to allow the fallback. The default.
+    Explain,
+    /// Fail with the plain error: `--remote` or `--cf-*` require a remote run.
+    Never,
+}
+
+/// How the client side of a created job ended.
+enum JobOutcome {
+    Completed,
+    /// The API refused to start the job for a reason that allows a fallback.
+    /// Nothing has run remotely.
+    StartRefused(CfmpegError),
+}
+
+async fn run_encode(ffmpeg_args: &[String], options: EncodeOptions) -> Result<i32> {
     let config = Config::load()?;
-    let effective_remote = remote.merge_defaults(&config.remote_execution_defaults()?);
+    let effective_remote = options
+        .remote
+        .merge_defaults(&config.remote_execution_defaults()?);
     let wait_timeout_seconds = remote_wait_timeout_seconds(&effective_remote);
 
-    if force_local {
+    if options.force_local {
         eprintln!("  warning: running locally because --local was provided.");
         return fallback::run_local(ffmpeg_args).await;
     }
 
     let parsed = parser::parse_ffmpeg_args(ffmpeg_args)?;
+    if !options.no_download {
+        local_output::preflight(&parsed.inputs, &parsed.outputs, parsed.overwrite)?;
+    }
+
+    let fallback = fallback_policy(
+        options.allow_fallback,
+        config.allow_fallback()?,
+        &effective_remote,
+    );
+    // From here on an interrupt is handled by cfmpeg, so that a job that
+    // exists on the server is always cancelled.
+    let mut interrupts = Interrupts::listen()?;
+
     let api = match ApiClient::from_config(&config) {
         Ok(api) => api,
-        Err(CfmpegError::NotAuthenticated) if allows_local_fallback(&config, &effective_remote) => {
-            eprintln!("  warning: not authenticated; falling back to local ffmpeg.");
-            eprintln!("  run `cfmpeg auth login` to use cloud execution.");
-            eprintln!();
-            return fallback::run_local(ffmpeg_args).await;
+        Err(error @ CfmpegError::NotAuthenticated) => {
+            return run_locally_or_fail(ffmpeg_args, fallback, &config, &effective_remote, error)
+                .await;
         }
         Err(error) => return Err(error),
     };
 
-    if let Err(error) = api.health_check().await {
-        if allows_local_fallback(&config, &effective_remote) {
-            eprintln!("  warning: {error}; falling back to local ffmpeg.");
-            if !effective_remote.is_empty() {
-                eprintln!(
-                    "  note: ignoring requested remote execution settings during local fallback."
-                );
-            }
-            eprintln!();
-            return fallback::run_local(ffmpeg_args).await;
-        }
-
-        return Err(error);
+    let health = tokio::select! {
+        health = api.health_check() => health,
+        interrupt = interrupts.next() => return Err(CfmpegError::Interrupted(interrupt)),
+    };
+    if let Err(error) = health {
+        return run_locally_or_fail(ffmpeg_args, fallback, &config, &effective_remote, error).await;
     }
     eprintln!(
         "  {} api reachable; using remote execution",
@@ -224,35 +286,129 @@ async fn run_encode(
         inputs: job_inputs,
         outputs,
         execution: effective_remote.clone(),
-        output_delivery: (!no_download && parsed.outputs.len() == 1).then_some(
+        output_delivery: (!options.no_download && parsed.outputs.len() == 1).then_some(
             OutputDeliveryRequest {
                 mode: OutputDeliveryMode::ProgressiveBatches,
             },
         ),
     };
 
+    // Not raced against interrupts: giving up on this request could leave a
+    // job on the server whose id cfmpeg never learned.
     let job = match api.create_job(&create_job_request).await {
         Ok(job) => job,
-        Err(error) => {
-            if let Some(result) =
-                maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
-            {
-                return result;
-            }
-
-            return Err(error);
+        Err(error) if should_fallback_to_local(&error) => {
+            return run_locally_or_fail(ffmpeg_args, fallback, &config, &effective_remote, error)
+                .await;
         }
+        Err(error) => return Err(error),
     };
 
     eprintln!("  {} job {}", style("->").cyan(), style(&job.job_id).dim());
     eprintln!("  {} starting remote execution", style("->").cyan());
 
+    // Set once the job has completed on the server. From then on a failure is
+    // a failed download of a result that was paid for, never a reason to cancel.
+    let job_completed = Cell::new(false);
+    let work = run_remote_job(
+        &api,
+        &http_client,
+        &job,
+        &parsed,
+        options.no_download,
+        wait_timeout_seconds,
+        &job_completed,
+    );
+    let outcome =
+        interrupt::run_remote_work(&api, &job.job_id, &mut interrupts, &job_completed, work).await;
+
+    match outcome {
+        Ok(JobOutcome::Completed) => Ok(0),
+        Ok(JobOutcome::StartRefused(error)) => {
+            // The job was created but never started; cancelling it makes sure
+            // that nothing stays behind.
+            interrupt::cancel_remote_job(&api, &job.job_id, &mut interrupts).await;
+
+            run_locally_or_fail(ffmpeg_args, fallback, &config, &effective_remote, error).await
+        }
+        Err(error) => {
+            if job_completed.get() {
+                // A second interrupt gives up on listing the outputs.
+                let listing = tokio::select! {
+                    listing = api.get_outputs(&job.job_id) => Some(listing),
+                    _ = interrupts.next() => None,
+                };
+                for line in remaining_output_lines(&job.job_id, listing) {
+                    eprintln!("  {line}");
+                }
+            }
+
+            Err(error)
+        }
+    }
+}
+
+/// Says how to get the outputs of a completed job when cfmpeg could not
+/// deliver them: with `cfmpeg download`, or from the signed URLs directly.
+fn remaining_output_lines(job_id: &str, listing: Option<Result<JobOutputResponse>>) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} remote job {job_id} completed and was not cancelled; fetch its outputs again with `cfmpeg download {job_id}` while cloud storage still has them",
+        style("->").cyan()
+    )];
+
+    match listing {
+        Some(Ok(listing)) if !listing.outputs.is_empty() => {
+            lines.push("or download them from these signed URLs:".to_string());
+            lines.extend(
+                listing
+                    .outputs
+                    .iter()
+                    .map(|output| format!("{}\t{}", output.filename, output.download_url)),
+            );
+        }
+        Some(Ok(listing)) => {
+            lines.push(
+                "or download its parts from these signed URLs and join them in this order with ffmpeg's concat demuxer:"
+                    .to_string(),
+            );
+            lines.extend(
+                listing
+                    .batches
+                    .iter()
+                    .map(|batch| format!("{}\t{}", batch.filename, batch.download_url)),
+            );
+        }
+        Some(Err(error)) => lines.push(format!("could not list their download URLs: {error}")),
+        None => {}
+    }
+
+    lines
+}
+
+/// Uploads the inputs of a created job, waits for it and delivers its outputs.
+async fn run_remote_job(
+    api: &ApiClient,
+    http_client: &Client,
+    job: &CreateJobResponse,
+    parsed: &ParsedCommand,
+    no_download: bool,
+    wait_timeout_seconds: u64,
+    job_completed: &Cell<bool>,
+) -> Result<JobOutcome> {
+    let wait_for_job = || async move {
+        let finished =
+            job::wait_for_completion(api, http_client, &job.job_id, wait_timeout_seconds).await;
+        if finished.is_ok() {
+            job_completed.set(true);
+        }
+        finished
+    };
     let local_inputs: Vec<_> = parsed
         .inputs
         .iter()
         .filter_map(|input| match input {
             Input::LocalFile { path, .. } => Some(path.clone()),
-            _ => None,
+            Input::Special(_) | Input::Url(_) => None,
         })
         .collect();
 
@@ -270,29 +426,22 @@ async fn run_encode(
             );
             eprintln!();
 
-            let monitor_api = api.clone();
-            let monitor_http_client = http_client.clone();
-            let monitor_job_id = job.job_id.clone();
-            let monitor = tokio::spawn(async move {
-                job::wait_for_completion(
-                    &monitor_api,
-                    &monitor_http_client,
-                    &monitor_job_id,
-                    wait_timeout_seconds,
-                )
-                .await
-            });
+            let monitor = wait_for_job();
+            let upload = stream::stream_input(http_client, &job.ingest, input_path);
+            tokio::pin!(monitor, upload);
 
-            if let Err(error) = stream::stream_input(&http_client, &job.ingest, input_path).await {
-                monitor.abort();
-                let _ = monitor.await;
-
-                return Err(error);
+            // The job is watched while the input streams. A failed upload ends
+            // the wait, and a job that fails first ends the upload.
+            tokio::select! {
+                uploaded = &mut upload => {
+                    uploaded?;
+                    monitor.await?;
+                }
+                finished = &mut monitor => {
+                    finished?;
+                    upload.await?;
+                }
             }
-
-            monitor.await.map_err(|error| {
-                CfmpegError::JobFailed(format!("job monitor task failed: {error}"))
-            })??;
         }
         IngestMode::SegmentedUpload => {
             let [input_path] = local_inputs.as_slice() else {
@@ -318,8 +467,8 @@ async fn run_encode(
 
             api.prepare_job(&job.job_id).await?;
             let segment_count = upload::upload_segmented_file(
-                &api,
-                &http_client,
+                api,
+                http_client,
                 input_path,
                 &job.job_id,
                 &job.ingest,
@@ -329,52 +478,46 @@ async fn run_encode(
             api.complete_segmented_ingest(&job.job_id, &CompleteIngestRequest { segment_count })
                 .await?;
 
-            let stop_downloads = Arc::new(AtomicBool::new(false));
-            let progressive_download = if use_progressive_batches {
-                let download_api = api.clone();
-                let download_client = http_client.clone();
-                let job_id = job.job_id.clone();
-                let output_path = parsed.outputs[0].path.clone();
-                let stop = Arc::clone(&stop_downloads);
+            if use_progressive_batches {
+                let stop_downloads = AtomicBool::new(false);
+                let download = download::download_progressive_batches(
+                    api,
+                    http_client,
+                    &job.job_id,
+                    &parsed.outputs[0].path,
+                    &stop_downloads,
+                    parsed.overwrite,
+                );
+                let completion = async {
+                    let completed = wait_for_job().await;
+                    stop_downloads.store(true, Ordering::Relaxed);
+                    completed
+                };
+                tokio::pin!(download, completion);
 
-                Some(tokio::spawn(async move {
-                    download::download_progressive_batches(
-                        &download_api,
-                        &download_client,
-                        &job_id,
-                        &output_path,
-                        stop,
-                    )
-                    .await
-                }))
-            } else {
-                None
-            };
-
-            let completion_result =
-                job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds)
-                    .await;
-            stop_downloads.store(true, Ordering::Relaxed);
-
-            match (completion_result, progressive_download) {
-                (Ok(()), Some(handle)) => {
-                    handle.await.map_err(|error| {
-                        CfmpegError::JobFailed(format!("progressive download task failed: {error}"))
-                    })??;
-
-                    eprintln!();
-                    print_local_completion(&parsed.outputs);
-                    return Ok(());
+                // Batches download while the job runs. A failed job drops the
+                // download at once; a completed job lets it fetch the rest.
+                let mut downloaded = None;
+                let completed = loop {
+                    tokio::select! {
+                        completed = &mut completion => break completed,
+                        result = &mut download, if downloaded.is_none() => {
+                            downloaded = Some(result);
+                        }
+                    }
+                };
+                completed?;
+                match downloaded {
+                    Some(result) => result?,
+                    None => download.await?,
                 }
-                (Err(error), Some(handle)) => {
-                    handle.abort();
-                    let _ = handle.await;
-                    return Err(error);
-                }
-                (result, None) => {
-                    result?;
-                }
+
+                eprintln!();
+                print_local_completion(&parsed.outputs);
+                return Ok(JobOutcome::Completed);
             }
+
+            wait_for_job().await?;
         }
         IngestMode::Durable => {
             if job.uploads.len() < local_inputs.len() {
@@ -397,7 +540,7 @@ async fn run_encode(
                 eprintln!();
 
                 for (path, target) in local_inputs.iter().zip(&job.uploads) {
-                    let parts = upload::upload_file(&http_client, path, target).await?;
+                    let parts = upload::upload_file(http_client, path, target).await?;
 
                     if !parts.is_empty() {
                         multipart_uploads.push(CompletedMultipartUpload {
@@ -409,20 +552,18 @@ async fn run_encode(
                 eprintln!();
             }
 
-            if let Err(error) = api
+            match api
                 .start_job(&job.job_id, &StartJobRequest { multipart_uploads })
                 .await
             {
-                if let Some(result) =
-                    maybe_fallback_to_local(ffmpeg_args, &config, &effective_remote, &error).await
-                {
-                    return result;
+                Ok(_) => {}
+                Err(error) if should_fallback_to_local(&error) => {
+                    return Ok(JobOutcome::StartRefused(error));
                 }
-
-                return Err(error);
+                Err(error) => return Err(error),
             }
 
-            job::wait_for_completion(&api, &http_client, &job.job_id, wait_timeout_seconds).await?;
+            wait_for_job().await?;
         }
     }
 
@@ -440,12 +581,70 @@ async fn run_encode(
     } else {
         eprintln!();
         eprintln!("  {} downloading outputs", style("->").cyan());
-        download::download_outputs(&http_client, &outputs.outputs, &parsed.outputs).await?;
+        download::download_outputs(
+            http_client,
+            &outputs.outputs,
+            &parsed.outputs,
+            parsed.overwrite,
+        )
+        .await?;
         eprintln!();
         print_local_completion(&parsed.outputs);
     }
 
-    Ok(())
+    Ok(JobOutcome::Completed)
+}
+
+/// Ends a run that cannot execute remotely because of `error`: with local
+/// ffmpeg when the fallback is allowed, with an error otherwise.
+async fn run_locally_or_fail(
+    ffmpeg_args: &[String],
+    fallback: Fallback,
+    config: &Config,
+    effective_remote: &RemoteExecutionOptions,
+    error: CfmpegError,
+) -> Result<i32> {
+    let reason = if api_error_code(&error) == Some("insufficient_funds") {
+        format!(
+            "remote balance is too low; top up at {}",
+            config.dashboard_billing_url()
+        )
+    } else {
+        error.to_string()
+    };
+
+    match fallback {
+        Fallback::Never => Err(error),
+        Fallback::Explain => Err(CfmpegError::RemoteUnavailable { reason }),
+        Fallback::Local => {
+            eprintln!(
+                "  {} remote execution is unavailable ({reason}); running locally with ffmpeg because fallback is allowed.",
+                style("warning:").yellow().bold()
+            );
+            if !effective_remote.is_empty() {
+                eprintln!(
+                    "  note: ignoring requested remote execution settings during local fallback."
+                );
+            }
+            eprintln!();
+
+            fallback::run_local(ffmpeg_args).await
+        }
+    }
+}
+
+fn fallback_policy(
+    allowed_by_flag: bool,
+    allowed_by_config: bool,
+    effective_remote: &RemoteExecutionOptions,
+) -> Fallback {
+    if allowed_by_flag || (allowed_by_config && !effective_remote.strict_remote) {
+        Fallback::Local
+    } else if effective_remote.strict_remote {
+        Fallback::Never
+    } else {
+        Fallback::Explain
+    }
 }
 
 async fn show_usage() -> Result<()> {
@@ -525,43 +724,7 @@ async fn show_version() -> Result<()> {
     Ok(())
 }
 
-async fn maybe_fallback_to_local(
-    ffmpeg_args: &[String],
-    config: &Config,
-    effective_remote: &remote::RemoteExecutionOptions,
-    error: &CfmpegError,
-) -> Option<Result<()>> {
-    if !allows_local_fallback(config, effective_remote) || !should_fallback_to_local(error) {
-        return None;
-    }
-
-    match api_error_code(error) {
-        Some("insufficient_funds") => {
-            eprintln!("  warning: remote balance is too low; falling back to local ffmpeg.");
-            eprintln!("  top up at {}", config.dashboard_billing_url());
-        }
-        _ => {
-            eprintln!("  warning: {error}; falling back to local ffmpeg.");
-        }
-    }
-
-    if !effective_remote.is_empty() {
-        eprintln!("  note: ignoring requested remote execution settings during local fallback.");
-    }
-
-    eprintln!();
-
-    Some(fallback::run_local(ffmpeg_args).await)
-}
-
-fn allows_local_fallback(
-    config: &Config,
-    effective_remote: &remote::RemoteExecutionOptions,
-) -> bool {
-    config.local_fallback && !effective_remote.strict_remote
-}
-
-fn remote_wait_timeout_seconds(effective_remote: &remote::RemoteExecutionOptions) -> u64 {
+fn remote_wait_timeout_seconds(effective_remote: &RemoteExecutionOptions) -> u64 {
     effective_remote
         .timeout_seconds
         .map(u64::from)
@@ -609,7 +772,7 @@ fn currency_symbol(currency: &str) -> &str {
 struct DisplayConfig {
     api_key: Option<String>,
     api_base: String,
-    local_fallback: bool,
+    allow_fallback: bool,
     remote_profile: Option<String>,
     remote_cpu: Option<u16>,
     remote_memory_mb: Option<u32>,
@@ -619,11 +782,11 @@ struct DisplayConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        allows_local_fallback, format_file_size, format_money_from_millicents, format_usage_report,
+        fallback_policy, format_file_size, format_money_from_millicents, format_usage_report,
         local_output_summary_lines, remote_wait_timeout_seconds, should_fallback_to_local,
+        Fallback,
     };
     use crate::api::UsageResponse;
-    use crate::config::Config;
     use crate::error::CfmpegError;
     use crate::parser::Output;
     use crate::remote::RemoteExecutionOptions;
@@ -694,26 +857,33 @@ mod tests {
     }
 
     #[test]
-    fn allows_local_fallback_for_remote_defaults() {
-        let config = Config::default();
+    fn fallback_is_explained_but_not_taken_by_default() {
         let remote = RemoteExecutionOptions {
             profile: Some("balanced".to_string()),
             ..RemoteExecutionOptions::default()
         };
 
-        assert!(allows_local_fallback(&config, &remote));
+        assert_eq!(fallback_policy(false, false, &remote), Fallback::Explain);
     }
 
     #[test]
-    fn strict_remote_requests_disable_local_fallback() {
-        let config = Config::default();
+    fn fallback_is_taken_when_the_flag_or_the_config_allows_it() {
+        let remote = RemoteExecutionOptions::default();
+
+        assert_eq!(fallback_policy(true, false, &remote), Fallback::Local);
+        assert_eq!(fallback_policy(false, true, &remote), Fallback::Local);
+    }
+
+    #[test]
+    fn strict_remote_requests_never_fall_back_on_config_alone() {
         let remote = RemoteExecutionOptions {
             cpu: Some(8),
             strict_remote: true,
             ..RemoteExecutionOptions::default()
         };
 
-        assert!(!allows_local_fallback(&config, &remote));
+        assert_eq!(fallback_policy(false, true, &remote), Fallback::Never);
+        assert_eq!(fallback_policy(false, false, &remote), Fallback::Never);
     }
 
     #[test]

@@ -122,7 +122,9 @@ pub async fn upload_segmented_file(
         .arg("1")
         .arg(segment_template.as_os_str())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // An interrupted upload must not leave the segmenter running.
+        .kill_on_drop(true);
 
     let mut child = segmenter.spawn()?;
     let mut state = SegmentUploadState::default();

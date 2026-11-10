@@ -1,4 +1,7 @@
 use crate::error::{CfmpegError, Result};
+use crate::ffmpeg_options::{self, OptionSyntax};
+use crate::local_references;
+use crate::output_support::{self, OutputOptions};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -14,193 +17,142 @@ pub struct Output {
     pub remote_name: String,
 }
 
+/// What to do with an output file that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overwrite {
+    /// Replace it: `-y`, and also the default because cfmpeg never prompts.
+    Allowed,
+    /// Refuse to run: `-n`.
+    Never,
+}
+
 #[derive(Debug)]
 pub struct ParsedCommand {
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
     pub sandbox_args: Vec<String>,
+    pub overwrite: Overwrite,
 }
 
-// ffmpeg allows many options to carry per-stream suffixes like `:v:0`.
-// Matching option families keeps the parser table smaller and avoids
-// duplicating every stream-specific spelling by hand.
-const VALUED_OPTION_FAMILIES: &[&str] = &[
-    "-ab",
-    "-ac",
-    "-acodec",
-    "-af",
-    "-aframes",
-    "-ar",
-    "-aspect",
-    "-aq",
-    "-atag",
-    "-b",
-    "-bsf",
-    "-bufsize",
-    "-c",
-    "-canvas_size",
-    "-ch_layout",
-    "-channel_layout",
-    "-codec",
-    "-color_primaries",
-    "-colorspace",
-    "-color_trc",
-    "-crf",
-    "-dcodec",
-    "-disposition",
-    "-f",
-    "-fflags",
-    "-filter",
-    "-filter_complex",
-    "-filter_complex_script",
-    "-filter_script",
-    "-filter_threads",
-    "-framerate",
-    "-frames",
-    "-fpsmax",
-    "-fs",
-    "-g",
-    "-guess_layout_max",
-    "-hls_list_size",
-    "-hls_segment_filename",
-    "-hls_time",
-    "-hwaccel",
-    "-hwaccel_device",
-    "-hwaccel_output_format",
-    "-itsscale",
-    "-itsoffset",
-    "-keyint_min",
-    "-lavfi",
-    "-level",
-    "-loglevel",
-    "-map",
-    "-map_chapters",
-    "-map_metadata",
-    "-max_muxing_queue_size",
-    "-maxrate",
-    "-metadata",
-    "-minrate",
-    "-movflags",
-    "-muxdelay",
-    "-muxpreload",
-    "-pass",
-    "-passlogfile",
-    "-pix_fmt",
-    "-preset",
-    "-pre",
-    "-profile",
-    "-q",
-    "-qscale",
-    "-qp",
-    "-r",
-    "-rc-lookahead",
-    "-readrate",
-    "-readrate_catchup",
-    "-readrate_initial_burst",
-    "-s",
-    "-sample_fmt",
-    "-sc_threshold",
-    "-scodec",
-    "-segment_list",
-    "-segment_time",
-    "-spatial-aq",
-    "-spre",
-    "-ss",
-    "-sseof",
-    "-start_number",
-    "-stats_period",
-    "-stream_loop",
-    "-t",
-    "-tag",
-    "-temporal-aq",
-    "-threads",
-    "-thread_queue_size",
-    "-timecode",
-    "-timestamp",
-    "-to",
-    "-tune",
-    "-vcodec",
-    "-vf",
-    "-vframes",
-    "-vpre",
-    "-vtag",
-    "-video_size",
-    "-vsync",
-];
-
+/// Splits an ffmpeg command line into inputs, outputs and the arguments the
+/// remote worker runs, the way ffmpeg 8 itself reads it.
+///
+/// Fails without guessing when an option is not known, and when an input or
+/// output cannot work on a remote worker.
 pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     let mut sandbox_args = Vec::new();
     let mut input_counter = 0usize;
-    let mut output_counter = 0usize;
-    let mut concat_input_pending = false;
+    // ffmpeg applies options to the next input or output that follows them.
+    let mut pending = OutputOptions::default();
+    let mut force_overwrite = false;
+    let mut never_overwrite = false;
+    // ffmpeg reads the token after `--` as an output file even when it starts
+    // with a dash.
+    let mut after_double_dash = false;
 
-    let mut index = 0usize;
-    while index < args.len() {
-        let arg = &args[index];
+    let mut tokens = args.iter();
+    while let Some(arg) = tokens.next() {
+        if arg == "--" && !after_double_dash {
+            sandbox_args.push(arg.clone());
+            after_double_dash = true;
+            continue;
+        }
+
+        if std::mem::take(&mut after_double_dash) || !arg.starts_with('-') || arg == "-" {
+            // ffmpeg reads `file:out.mp4` as the plain path `out.mp4`.
+            let output = arg.strip_prefix("file:").unwrap_or(arg);
+            output_support::ensure_supported(output, &pending)?;
+
+            let output_path = PathBuf::from(output);
+            let remote_name = build_remote_output_name(&output_path, outputs.len());
+            sandbox_args.push(rewrite_output(&remote_name));
+            outputs.push(Output {
+                path: output_path,
+                remote_name,
+            });
+            pending = OutputOptions::default();
+            continue;
+        }
 
         if arg == "-i" {
-            sandbox_args.push(arg.clone());
-            index += 1;
-
-            let input_arg = args.get(index).ok_or_else(|| {
+            let input_arg = tokens.next().ok_or_else(|| {
                 CfmpegError::ParseError("-i flag requires an input path or URL".to_string())
             })?;
 
-            if concat_input_pending {
+            if pending
+                .format
+                .as_deref()
+                .is_some_and(|format| format.eq_ignore_ascii_case("concat"))
+            {
                 return Err(CfmpegError::ParseError(
                     "concat file lists are not supported for remote execution; use `--local` or expand the concat inputs before submitting the job".to_string(),
                 ));
             }
 
-            let input = classify_input(input_arg)?;
+            let input = classify_input(input_arg, pending.format.as_deref())?;
+            sandbox_args.push(arg.clone());
             sandbox_args.push(rewrite_input(&input, input_counter));
             if matches!(input, Input::LocalFile { .. }) {
                 input_counter += 1;
             }
             inputs.push(input);
-            concat_input_pending = false;
-            index += 1;
+            pending = OutputOptions::default();
             continue;
         }
 
-        if is_valued_option(arg) {
-            reject_remote_referenced_option(arg)?;
-            sandbox_args.push(arg.clone());
+        let option =
+            ffmpeg_options::classify(arg).ok_or_else(|| CfmpegError::UnknownOption(arg.clone()))?;
 
-            if let Some((_, value)) = arg.split_once('=') {
-                observe_valued_option(arg, value, &mut concat_input_pending);
-                index += 1;
-                continue;
+        match option.syntax {
+            OptionSyntax::Info => {
+                return Err(CfmpegError::ParseError(format!(
+                    "{arg} prints ffmpeg information instead of running a job; run it with `--local`"
+                )));
             }
+            OptionSyntax::ValueFromFile => {
+                return Err(CfmpegError::ParseError(format!(
+                    "{arg} reads its value from a local file, which is not supported for remote execution; use `--local` or pass the value inline"
+                )));
+            }
+            OptionSyntax::Flag => {
+                local_references::ensure_option_works_remotely(arg, option.name, None)?;
 
-            index += 1;
+                match option.name {
+                    "y" => force_overwrite = !option.negated,
+                    "n" => never_overwrite = !option.negated,
+                    _ => {}
+                }
+                sandbox_args.push(arg.clone());
+            }
+            OptionSyntax::Value => {
+                if matches!(option.name, "filter_script" | "filter_complex_script") {
+                    return Err(CfmpegError::ParseError(format!(
+                        "{arg} references a local script file, which is not supported for remote execution; use `--local` or inline the filter graph"
+                    )));
+                }
 
-            let value = args
-                .get(index)
-                .ok_or_else(|| CfmpegError::ParseError(format!("{arg} requires an argument")))?;
-            observe_valued_option(arg, value, &mut concat_input_pending);
-            sandbox_args.push(value.clone());
-            index += 1;
-            continue;
+                let value = tokens.next().ok_or_else(|| {
+                    CfmpegError::ParseError(format!("{arg} requires an argument"))
+                })?;
+                local_references::ensure_option_works_remotely(arg, option.name, Some(value))?;
+
+                match option.name {
+                    "f" => pending.format = Some(value.clone()),
+                    "strftime" => {
+                        // The spellings ffmpeg reads as a false boolean.
+                        pending.strftime = !matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "0" | "n" | "no" | "false" | "off" | "disable" | "disabled"
+                        );
+                    }
+                    _ => {}
+                }
+                sandbox_args.push(arg.clone());
+                sandbox_args.push(value.clone());
+            }
         }
-
-        if arg.starts_with('-') && arg.len() > 1 {
-            sandbox_args.push(arg.clone());
-            index += 1;
-            continue;
-        }
-
-        let output_path = PathBuf::from(arg);
-        let remote_name = build_remote_output_name(&output_path, output_counter);
-        sandbox_args.push(rewrite_output(&remote_name));
-        outputs.push(Output {
-            path: output_path,
-            remote_name,
-        });
-        output_counter += 1;
-        index += 1;
     }
 
     if outputs.is_empty() {
@@ -215,14 +167,39 @@ pub fn parse_ffmpeg_args(args: &[String]) -> Result<ParsedCommand> {
         ));
     }
 
+    let overwrite = match (force_overwrite, never_overwrite) {
+        (true, true) => {
+            return Err(CfmpegError::ParseError(
+                "both -y and -n supplied".to_string(),
+            ));
+        }
+        (_, true) => Overwrite::Never,
+        (_, false) => Overwrite::Allowed,
+    };
+
     Ok(ParsedCommand {
         inputs,
         outputs,
         sandbox_args,
+        overwrite,
     })
 }
 
-fn classify_input(path: &str) -> Result<Input> {
+fn classify_input(path: &str, format: Option<&str>) -> Result<Input> {
+    // With `-f lavfi` the input is a filtergraph that generates the media, not
+    // a file, whatever it is called.
+    if format.is_some_and(|format| format.eq_ignore_ascii_case("lavfi")) {
+        local_references::ensure_graph_works_remotely("-i", path)?;
+
+        if !is_special_input(path) {
+            return Err(CfmpegError::ParseError(format!(
+                "lavfi input `{path}` is not supported for remote execution yet; the workers accept graphs that start with color=, testsrc, anullsrc or nullsrc; run this command with `--local`"
+            )));
+        }
+
+        return Ok(Input::Special(path.to_string()));
+    }
+
     if is_remote_url(path) {
         return Ok(Input::Url(path.to_string()));
     }
@@ -237,6 +214,8 @@ fn classify_input(path: &str) -> Result<Input> {
         return Ok(Input::Special(path.to_string()));
     }
 
+    // ffmpeg reads `file:in.mov` as the plain path `in.mov`.
+    let path = path.strip_prefix("file:").unwrap_or(path);
     let path_buf = PathBuf::from(path);
     if !path_buf.exists() {
         return Err(CfmpegError::InputNotFound(path.to_string()));
@@ -299,51 +278,380 @@ fn build_remote_output_name(output_path: &Path, output_counter: usize) -> String
     format!("output_{output_counter}{extension}")
 }
 
-fn is_valued_option(arg: &str) -> bool {
-    VALUED_OPTION_FAMILIES
-        .iter()
-        .any(|family| matches_option_family(arg, family))
-}
-
-fn matches_option_family(arg: &str, family: &str) -> bool {
-    let option = option_name(arg);
-    option == family
-        || option
-            .strip_prefix(family)
-            .is_some_and(|suffix| suffix.starts_with(':'))
-}
-
-fn option_name(arg: &str) -> &str {
-    arg.split_once('=').map(|(option, _)| option).unwrap_or(arg)
-}
-
-fn observe_valued_option(arg: &str, value: &str, concat_input_pending: &mut bool) {
-    if option_name(arg) == "-f" {
-        *concat_input_pending = value.eq_ignore_ascii_case("concat");
-    }
-}
-
-fn reject_remote_referenced_option(arg: &str) -> Result<()> {
-    if matches_option_family(arg, "-filter_complex_script")
-        || matches_option_family(arg, "-filter_script")
-    {
-        return Err(CfmpegError::ParseError(format!(
-            "{arg} references a local script file, which is not supported for remote execution; use `--local` or inline the filter graph"
-        )));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_ffmpeg_args, Input};
+    use super::{parse_ffmpeg_args, Input, Overwrite, ParsedCommand};
+    use crate::error::{CfmpegError, Result};
     use std::fs;
     use std::path::PathBuf;
     use uuid::Uuid;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("cfmpeg-parser-{name}-{}", Uuid::new_v4()))
+    }
+
+    /// Parses `-i <url>` followed by `rest`.
+    fn parse_after_url_input(rest: &[&str]) -> Result<ParsedCommand> {
+        let mut args = vec![
+            "-i".to_string(),
+            "https://example.com/input.mov".to_string(),
+        ];
+        args.extend(rest.iter().map(|arg| (*arg).to_string()));
+
+        parse_ffmpeg_args(&args)
+    }
+
+    fn output_paths(parsed: &ParsedCommand) -> Vec<PathBuf> {
+        parsed
+            .outputs
+            .iter()
+            .map(|output| output.path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn option_values_are_never_mistaken_for_output_files() {
+        for (option, value) in [
+            ("-x265-params", "crf=28"),
+            ("-x264-params", "keyint=48:min-keyint=48"),
+            ("-force_key_frames", "expr:gte(t,n_forced*2)"),
+            ("-strict", "experimental"),
+            ("-fps_mode", "cfr"),
+            ("-probesize", "50M"),
+            ("-analyzeduration", "100M"),
+            ("-movflags", "+faststart"),
+            ("-b:a:0", "128k"),
+            ("-c:v", "libx264"),
+            ("-filter:v", "scale=1280:-2"),
+            ("-metadata:s:a:0", "language=eng"),
+            ("-disposition:a:1", "default"),
+            ("-map", "-0:s"),
+            ("-s", "1280x720"),
+            ("-crf", "23"),
+            ("-preset", "slow"),
+            ("-pix_fmt", "yuv420p"),
+            ("-thread_queue_size", "512"),
+            ("-avoid_negative_ts", "make_zero"),
+            ("-sws_flags", "lanczos"),
+        ] {
+            let parsed = parse_after_url_input(&[option, value, "output.mp4"])
+                .unwrap_or_else(|error| panic!("{option} {value}: {error}"));
+
+            assert_eq!(
+                output_paths(&parsed),
+                vec![PathBuf::from("output.mp4")],
+                "{option}"
+            );
+            assert_eq!(
+                parsed.sandbox_args[2..],
+                [option, value, "/tmp/cfmpeg/outputs/output_0.mp4"],
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_the_commands_documented_in_the_readme() {
+        for command in [
+            "-i https://example.com/input.mov -c:v libx265 -crf 28 output.mp4",
+            "-f lavfi -i testsrc=size=128x128:rate=1 -t 1 -pix_fmt yuv420p /tmp/cfmpeg-smoke.mp4",
+            "-i https://example.com/input.mp4 -c:v libx264 -crf 30 -preset veryfast /tmp/cfmpeg-url-smoke.mp4",
+        ] {
+            let args: Vec<String> = command.split(' ').map(str::to_string).collect();
+
+            let parsed =
+                parse_ffmpeg_args(&args).unwrap_or_else(|error| panic!("{command}: {error}"));
+
+            assert_eq!(parsed.outputs.len(), 1, "{command}");
+        }
+    }
+
+    #[test]
+    fn treats_lavfi_graphs_as_generated_inputs_not_files() {
+        for graph in [
+            "color=c=black:s=1280x720",
+            "testsrc2=size=640x360:rate=30",
+            "anullsrc=r=48000:cl=stereo",
+            "nullsrc=s=64x64",
+        ] {
+            let args = ["-f", "lavfi", "-i", graph, "-t", "1", "output.mp4"].map(str::to_string);
+
+            let parsed =
+                parse_ffmpeg_args(&args).unwrap_or_else(|error| panic!("{graph}: {error}"));
+
+            assert!(
+                matches!(&parsed.inputs[0], Input::Special(value) if value == graph),
+                "{graph}"
+            );
+            assert_eq!(parsed.sandbox_args[..4], ["-f", "lavfi", "-i", graph]);
+        }
+    }
+
+    #[test]
+    fn explains_lavfi_graphs_the_workers_do_not_accept_yet() {
+        for graph in ["sine=frequency=440", "smptebars=size=640x360", "mandelbrot"] {
+            let args = ["-f", "lavfi", "-i", graph, "-t", "1", "output.mp4"].map(str::to_string);
+
+            let error = parse_ffmpeg_args(&args).expect_err(graph);
+
+            assert!(
+                matches!(error, CfmpegError::ParseError(_)),
+                "{graph}: {error}"
+            );
+            assert!(
+                error.to_string().contains("lavfi input")
+                    && error.to_string().contains("`--local`"),
+                "{graph}: {error}"
+            );
+        }
+
+        let args = ["-f", "lavfi", "-i", "movie=clip.mp4", "output.mp4"].map(str::to_string);
+        let error = parse_ffmpeg_args(&args).expect_err("movie source");
+        assert!(error
+            .to_string()
+            .contains("the `movie` filter reads the local path `clip.mp4`"));
+    }
+
+    #[test]
+    fn rejects_options_and_filters_that_need_local_side_files() {
+        for rest in [
+            &["-pass", "1", "-an", "output.mp4"][..],
+            &["-pass:v", "2", "-passlogfile", "stats", "output.mp4"][..],
+            &["-attach", "font.ttf", "output.mkv"][..],
+            &["-fpre", "fast.ffpreset", "output.mp4"][..],
+            &["-vpre", "fast", "output.mp4"][..],
+            &["-vstats", "output.mp4"][..],
+            &["-vstats_file", "stats.log", "output.mp4"][..],
+            &["-sdp_file", "out.sdp", "output.mp4"][..],
+            &["-progress", "progress.txt", "output.mp4"][..],
+            &["-vf", "subtitles=subs.srt", "output.mp4"][..],
+            &["-filter:v", "ass=subs.ass", "output.mp4"][..],
+            &["-af", "arnndn=m=speech.rnnn", "output.mp4"][..],
+            &[
+                "-filter_complex",
+                "movie=logo.png[wm];[0:v][wm]overlay=10:10",
+                "output.mp4",
+            ][..],
+            &[
+                "-lavfi",
+                "[0:v]lut3d=grade.cube[v]",
+                "-map",
+                "[v]",
+                "output.mp4",
+            ][..],
+        ] {
+            let error = match parse_after_url_input(rest) {
+                Ok(parsed) => panic!("{rest:?} parsed as {:?}", parsed.sandbox_args),
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(error, CfmpegError::UnsupportedOption { .. }),
+                "{rest:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_filters_and_progress_pipes_that_need_no_local_file() {
+        parse_after_url_input(&[
+            "-vf",
+            "scale=1280:-2,drawtext=text='subtitles=on':font=Sans",
+            "-af",
+            "loudnorm=I=-16",
+            "-progress",
+            "pipe:1",
+            "-stats",
+            "output.mp4",
+        ])
+        .expect("no local file is involved");
+    }
+
+    #[test]
+    fn reads_a_file_prefix_as_the_plain_path() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let input_path = directory.path().join("clip.mov");
+        fs::write(&input_path, b"video").expect("input file");
+        let args = vec![
+            "-i".to_string(),
+            format!("file:{}", input_path.display()),
+            "file:exports/output.mp4".to_string(),
+        ];
+
+        let parsed = parse_ffmpeg_args(&args).expect("parsed command");
+
+        assert!(matches!(&parsed.inputs[0], Input::LocalFile { path, .. } if *path == input_path));
+        assert_eq!(
+            output_paths(&parsed),
+            vec![PathBuf::from("exports/output.mp4")]
+        );
+        assert_eq!(
+            parsed.sandbox_args,
+            vec![
+                "-i",
+                "/tmp/cfmpeg/inputs/input_0.mov",
+                "/tmp/cfmpeg/outputs/output_0.mp4"
+            ]
+        );
+    }
+
+    #[test]
+    fn options_without_argument_do_not_consume_the_output() {
+        for flag in [
+            "-y",
+            "-n",
+            "-an",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-shortest",
+            "-hide_banner",
+            "-re",
+            "-copyts",
+            "-nostdin",
+            "-nostats",
+            "-noautorotate",
+        ] {
+            let parsed = parse_after_url_input(&[flag, "output.mp4"])
+                .unwrap_or_else(|error| panic!("{flag}: {error}"));
+
+            assert_eq!(
+                output_paths(&parsed),
+                vec![PathBuf::from("output.mp4")],
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_options_instead_of_guessing() {
+        let error = parse_after_url_input(&["-foo", "bar", "output.mp4"]).expect_err("unknown");
+
+        assert!(matches!(&error, CfmpegError::UnknownOption(option) if option == "-foo"));
+        assert_eq!(
+            error.to_string(),
+            "cfmpeg does not recognise the ffmpeg option `-foo`; if it is a valid ffmpeg 8 option, please report it at https://github.com/cfmpeg/cfmpeg-cli/issues, and meanwhile run this command with `--local`"
+        );
+    }
+
+    #[test]
+    fn rejects_information_options() {
+        let error = parse_after_url_input(&["-encoders"]).expect_err("information option");
+
+        assert!(error.to_string().contains("prints ffmpeg information"));
+    }
+
+    #[test]
+    fn rejects_option_values_loaded_from_local_files() {
+        let error = parse_after_url_input(&["-/filter:v", "graph.txt", "output.mp4"])
+            .expect_err("value from file");
+
+        assert!(error
+            .to_string()
+            .contains("reads its value from a local file"));
+    }
+
+    #[test]
+    fn reads_the_token_after_a_double_dash_as_an_output() {
+        let parsed = parse_after_url_input(&["--", "-dashed.mp4"]).expect("parsed command");
+
+        assert_eq!(output_paths(&parsed), vec![PathBuf::from("-dashed.mp4")]);
+        assert_eq!(
+            parsed.sandbox_args[2..],
+            ["--", "/tmp/cfmpeg/outputs/output_0.mp4"]
+        );
+    }
+
+    #[test]
+    fn overwrites_unless_n_is_given() {
+        for (flags, expected) in [
+            (&[][..], Overwrite::Allowed),
+            (&["-y"][..], Overwrite::Allowed),
+            (&["-n"][..], Overwrite::Never),
+            (&["-n", "-non"][..], Overwrite::Allowed),
+        ] {
+            let mut rest = flags.to_vec();
+            rest.push("output.mp4");
+
+            let parsed = parse_after_url_input(&rest).expect("parsed command");
+
+            assert_eq!(parsed.overwrite, expected, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_y_together_with_n_like_ffmpeg() {
+        let error = parse_after_url_input(&["-y", "-n", "output.mp4"]).expect_err("-y and -n");
+
+        assert!(error.to_string().contains("both -y and -n supplied"));
+    }
+
+    #[test]
+    fn rejects_outputs_that_write_more_than_the_named_file() {
+        for rest in [
+            &["-f", "hls", "-hls_time", "6", "stream.m3u8"][..],
+            &["-hls_time", "6", "stream.m3u8"][..],
+            &["-f", "dash", "manifest.mpd"][..],
+            &["manifest.mpd"][..],
+            &["-f", "segment", "-segment_time", "10", "part%03d.mp4"][..],
+            &["-f", "segment", "-segment_time", "10", "part.mp4"][..],
+            &["-f", "stream_segment", "part.ts"][..],
+            &["-f", "ssegment", "part.ts"][..],
+            &["-f", "tee", "[f=mp4]a.mp4|[f=flv]b.flv"][..],
+            &["thumb%03d.jpg"][..],
+            &["-f", "image2", "thumb%d.png"][..],
+            &["-strftime", "1", "shot-%Y%m%d.jpg"][..],
+            &["-f", "mpegts", "-"][..],
+            &["-f", "null", "-"][..],
+            &["-f", "mpegts", "pipe:"][..],
+            &["-f", "mpegts", "pipe:1"][..],
+            &["-f", "mpegts", "/dev/stdout"][..],
+            &["first.mp4", "-f", "hls", "second.m3u8"][..],
+        ] {
+            let error = match parse_after_url_input(rest) {
+                Ok(parsed) => panic!("{rest:?} parsed as {:?}", parsed.sandbox_args),
+                Err(error) => error,
+            };
+
+            assert!(
+                matches!(error, CfmpegError::UnsupportedOutput { .. }),
+                "{rest:?}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("not supported for remote execution yet")
+                    && error.to_string().contains("`--local`"),
+                "{rest:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_single_image_and_plain_multiple_outputs_working() {
+        let poster = parse_after_url_input(&["-f", "image2", "-frames:v", "1", "poster.jpg"])
+            .expect("single image");
+        assert_eq!(output_paths(&poster), vec![PathBuf::from("poster.jpg")]);
+
+        // `-f` applies to the next output only.
+        let several = parse_after_url_input(&[
+            "-f",
+            "mp4",
+            "first.m3u8",
+            "-strftime",
+            "0",
+            "second-100%.mp4",
+            "third.webm",
+        ])
+        .expect("several outputs");
+        assert_eq!(
+            output_paths(&several),
+            vec![
+                PathBuf::from("first.m3u8"),
+                PathBuf::from("second-100%.mp4"),
+                PathBuf::from("third.webm"),
+            ]
+        );
     }
 
     #[test]
@@ -491,27 +799,13 @@ mod tests {
     }
 
     #[test]
-    fn keeps_output_when_known_option_uses_inline_value_syntax() {
-        let args = vec![
-            "-i".to_string(),
-            "https://example.com/input.mov".to_string(),
-            "-c:v=libx264".to_string(),
-            "output.mp4".to_string(),
-        ];
+    fn reads_an_equals_sign_as_part_of_the_stream_specifier_like_ffmpeg() {
+        // ffmpeg has no `-option=value` form: `-c:v=libx264` is `-c` for the
+        // stream specifier `v=libx264`, and the next token is its argument.
+        let error = parse_after_url_input(&["-c:v=libx264", "output.mp4"])
+            .expect_err("output is consumed as the codec name");
 
-        let parsed = parse_ffmpeg_args(&args).expect("parsed command");
-
-        assert_eq!(parsed.outputs.len(), 1);
-        assert_eq!(parsed.outputs[0].path, PathBuf::from("output.mp4"));
-        assert_eq!(
-            parsed.sandbox_args,
-            vec![
-                "-i",
-                "https://example.com/input.mov",
-                "-c:v=libx264",
-                "/tmp/cfmpeg/outputs/output_0.mp4",
-            ]
-        );
+        assert!(error.to_string().contains("no output file detected"));
     }
 
     #[test]

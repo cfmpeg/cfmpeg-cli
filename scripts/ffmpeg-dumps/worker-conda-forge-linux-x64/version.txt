@@ -1,0 +1,12 @@
+ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers
+built with gcc 15.3.0 (conda-forge gcc 15.3.0-7)
+configuration: --prefix=/opt/conda --cc=x86_64-conda-linux-gnu-cc --cxx=x86_64-conda-linux-gnu-c++ --nm=x86_64-conda-linux-gnu-nm --ar=x86_64-conda-linux-gnu-ar --disable-doc --enable-openssl --enable-demuxer=dash --enable-hardcoded-tables --enable-libfreetype --enable-libharfbuzz --enable-libfontconfig --enable-libopenh264 --enable-libdav1d --disable-gnutls --enable-libvpx --enable-libass --enable-libplacebo --enable-pthreads --enable-alsa --enable-libpulse --enable-libvpl --enable-vaapi --enable-libopenvino --enable-gpl --enable-libx264 --enable-libx265 --enable-libmp3lame --enable-libaom --enable-libsvtav1 --enable-libxml2 --enable-pic --enable-shared --disable-static --enable-version3 --enable-zlib --enable-libvorbis --enable-libopus --enable-librsvg --enable-libjxl --enable-libwebp --enable-ffplay --enable-vulkan --enable-libshaderc --pkg-config=/home/conda/feedstock_root/build_artifacts/ffmpeg_1792526253504/_build_env/bin/pkg-config
+libavutil      60. 26.102 / 60. 26.102
+libavcodec     62. 28.102 / 62. 28.102
+libavformat    62. 12.102 / 62. 12.102
+libavdevice    62.  3.102 / 62.  3.102
+libavfilter    11. 14.102 / 11. 14.102
+libswscale      9.  5.102 /  9.  5.102
+libswresample   6.  3.102 /  6.  3.102
+
+Exiting with exit code 0

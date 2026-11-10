@@ -8,6 +8,8 @@ repository = "https://github.com/cfmpeg/cfmpeg-cli"
 homepage = "https://cfmpeg.com"
 keywords = ["ffmpeg", "video", "encoding", "cloud"]
 categories = ["command-line-utilities", "multimedia::video"]
+# Inputs of scripts/generate-ffmpeg-options.py; the generated table is in src/.
+exclude = ["scripts/ffmpeg-dumps/"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

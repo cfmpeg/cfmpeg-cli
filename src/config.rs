@@ -13,7 +13,8 @@ const DEFAULT_WEB_BASE: &str = "https://cfmpeg.com";
 pub struct Config {
     pub api_key: Option<String>,
     pub api_base: String,
-    pub local_fallback: bool,
+    /// Run local ffmpeg when remote execution is unavailable. Off by default.
+    pub allow_fallback: bool,
     pub remote_profile: Option<String>,
     pub remote_cpu: Option<u16>,
     pub remote_memory_mb: Option<u32>,
@@ -25,7 +26,7 @@ impl Default for Config {
         Self {
             api_key: None,
             api_base: DEFAULT_API_BASE.to_string(),
-            local_fallback: true,
+            allow_fallback: false,
             remote_profile: None,
             remote_cpu: None,
             remote_memory_mb: None,
@@ -100,6 +101,22 @@ impl Config {
             "{}/dashboard/billing",
             self.web_base().trim_end_matches('/')
         )
+    }
+
+    /// Whether a run may fall back to local ffmpeg when remote execution is
+    /// unavailable; `CFMPEG_ALLOW_FALLBACK` overrides the config file.
+    pub fn allow_fallback(&self) -> Result<bool> {
+        let Some(value) = option_from_env("CFMPEG_ALLOW_FALLBACK") else {
+            return Ok(self.allow_fallback);
+        };
+
+        match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(CfmpegError::Config(format!(
+                "invalid value for CFMPEG_ALLOW_FALLBACK: {value} (expected true or false)"
+            ))),
+        }
     }
 
     pub fn remote_execution_defaults(&self) -> Result<RemoteExecutionOptions> {
@@ -197,6 +214,44 @@ mod tests {
         unsafe {
             std::env::remove_var("CFMPEG_API_KEY");
         }
+    }
+
+    #[test]
+    fn fallback_is_off_by_default_and_ignores_the_retired_local_fallback_key() {
+        let config: Config =
+            toml::from_str("local_fallback = true\n").expect("old config should still parse");
+
+        assert!(!Config::default().allow_fallback);
+        assert!(!config.allow_fallback);
+    }
+
+    #[test]
+    fn allow_fallback_reads_config_key_and_environment_override() {
+        let enabled: Config = toml::from_str("allow_fallback = true\n").expect("config");
+        assert!(enabled.allow_fallback().expect("config value"));
+
+        unsafe {
+            std::env::set_var("CFMPEG_ALLOW_FALLBACK", "0");
+        }
+        let overridden = enabled.allow_fallback();
+        unsafe {
+            std::env::set_var("CFMPEG_ALLOW_FALLBACK", "yes");
+        }
+        let from_env = Config::default().allow_fallback();
+        unsafe {
+            std::env::set_var("CFMPEG_ALLOW_FALLBACK", "maybe");
+        }
+        let invalid = Config::default().allow_fallback();
+        unsafe {
+            std::env::remove_var("CFMPEG_ALLOW_FALLBACK");
+        }
+
+        assert!(!overridden.expect("env override"));
+        assert!(from_env.expect("env value"));
+        assert!(invalid
+            .expect_err("invalid env value")
+            .to_string()
+            .contains("CFMPEG_ALLOW_FALLBACK"));
     }
 
     #[test]
