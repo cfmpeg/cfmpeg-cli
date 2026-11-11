@@ -68,11 +68,15 @@ jobs:
   build-binaries:
     needs: prepare
     runs-on: ${{ matrix.os }}
+    env:
+      # Without this the helper ffmpeg targets the runner's own macOS version
+      # and refuses to start on anything older. Ignored on Linux.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             asset_name: cfmpeg-darwin-arm64
           - os: macos-15-intel
             asset_name: cfmpeg-darwin-x64
@@ -108,6 +112,14 @@ jobs:
 
       - name: Build bundled ffmpeg helpers
         run: bash scripts/build-helper-ffmpeg.sh "$RUNNER_TEMP/ffmpeg-helper"
+
+      - name: Show the minimum macOS version of the binaries
+        if: runner.os == 'macOS'
+        run: |
+          for binary in target/release/cfmpeg "$RUNNER_TEMP/ffmpeg-helper/bin/ffmpeg"; do
+            echo "$binary"
+            otool -l "$binary" | grep -A 4 LC_BUILD_VERSION | grep -E "minos|sdk"
+          done
 
       - name: Collect licence notices
         run: |
