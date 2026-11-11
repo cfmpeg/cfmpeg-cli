@@ -18,7 +18,7 @@ No Docker. No Python. No cloud credentials. Install, authenticate, go.
 
 ```bash
 # macOS and Linux: install script
-curl -fsSL https://cfmpeg.com/install.sh | sh
+curl -fsSL https://cfmpeg.com/install | sh
 
 # macOS and Linux: Homebrew
 brew install cfmpeg/tap/cfmpeg

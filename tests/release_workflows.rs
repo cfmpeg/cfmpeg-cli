@@ -1424,7 +1424,7 @@ fn readme_uses_the_cfmpeg_homebrew_namespace() {
 
     assert!(readme.contains("\nbrew install cfmpeg/tap/cfmpeg\n"));
     assert!(!readme.contains("brew tap "));
-    assert!(readme.contains("\ncurl -fsSL https://cfmpeg.com/install.sh | sh\n"));
+    assert!(readme.contains("\ncurl -fsSL https://cfmpeg.com/install | sh\n"));
 }
 
 #[test]
